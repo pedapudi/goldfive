@@ -4794,11 +4794,18 @@ def make_adk_plugin(
                 )
                 pending_tasks = ()
             try:
+                steering_config = getattr(steerer, "_steering_config", None)
                 drift = detect_capability_mismatch(
                     invoked_agent_name=invoked_agent_name,
                     invoked_agent_tools=tool_list,
                     task=chosen_task,
                     all_pending_tasks=pending_tasks,
+                    capability_rule_a_enabled=getattr(
+                        steering_config, "capability_rule_a_enabled", None
+                    ),
+                    capability_rule_c_enabled=getattr(
+                        steering_config, "capability_rule_c_enabled", None
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 — detector must not block
                 log.debug(

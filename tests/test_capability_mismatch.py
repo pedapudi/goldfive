@@ -119,6 +119,30 @@ def test_rule_a_soft_retired_silent_by_default() -> None:
     )
 
 
+def test_explicit_rule_a_policy_wins_over_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typed Rule A policy overrides the direct-call environment fallback."""
+    agent_tools: list[Any] = [_FakeAgentTool("writer")]
+    task = Task(id="draft", title="Draft the report", description="Write it.")
+
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_A", "1")
+    assert detect_capability_mismatch(
+        invoked_agent_name="coordinator",
+        invoked_agent_tools=agent_tools,
+        task=task,
+        capability_rule_a_enabled=False,
+    ) is None
+
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_A", "0")
+    assert detect_capability_mismatch(
+        invoked_agent_name="coordinator",
+        invoked_agent_tools=agent_tools,
+        task=task,
+        capability_rule_a_enabled=True,
+    ) is not None
+
+
 @pytest.mark.usefixtures("_rule_a_escape_hatch")
 def test_rule_a_positive_only_agent_tools_on_leaf_task() -> None:
     """An agent whose tools are ALL AgentTool wrappers, bound to a leaf
@@ -402,6 +426,33 @@ def test_rule_c_soft_retired_silent_by_default() -> None:
         "Rule C is soft-retired (goldfive#423 PR 2) and must be silent "
         "without GOLDFIVE_CAPABILITY_RULE_C=1"
     )
+
+
+def test_explicit_rule_c_policy_wins_over_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typed Rule C policy overrides the direct-call environment fallback."""
+    bound = Task(id="draft", title="Draft slides", description="Author slides.")
+    pending = [
+        bound,
+        Task(id="review", title="Review slides", description="Review the deck."),
+    ]
+    kwargs = {
+        "invoked_agent_name": "reviewer_agent",
+        "invoked_agent_tools": [_FakeFunctionTool("read")],
+        "task": bound,
+        "all_pending_tasks": pending,
+    }
+
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_C", "1")
+    assert detect_capability_mismatch(
+        **kwargs, capability_rule_c_enabled=False
+    ) is None
+
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_C", "0")
+    assert detect_capability_mismatch(
+        **kwargs, capability_rule_c_enabled=True
+    ) is not None
 
 
 @pytest.mark.usefixtures("_rule_c_escape_hatch")

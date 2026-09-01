@@ -35,6 +35,11 @@ Override via env var:
 * ``GOLDFIVE_STRICT_STATE_OWNERSHIP=0`` — force off everywhere.
 * unset — caller controls (test fixture vs production default).
 
+Runs built by :func:`goldfive.wrap` instead use
+``RuntimeConfig.strict_state_ownership``. The Runner applies that concrete
+value through a context-local override for the complete run and does not
+mutate the environment.
+
 Mechanism
 ---------
 
@@ -175,6 +180,29 @@ _expected_violation: contextvars.ContextVar[str | None] = contextvars.ContextVar
     default=None,
 )
 
+# A Runner installs its typed policy for the duration of one run. Context-local
+# storage prevents two concurrent Runners with different policies from changing
+# one another. ``None`` retains the legacy environment and pytest fallback for
+# direct low-level callers.
+_enabled_override: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "goldfive_state_ownership_enabled_override",
+    default=None,
+)
+
+
+def resolve_env_default() -> bool:
+    """Resolve the legacy environment and pytest default.
+
+    This function deliberately ignores the per-Runner override so
+    :meth:`RuntimeConfig.from_env` always captures process configuration.
+    """
+    raw = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return "pytest" in sys.modules
+
 
 def is_enabled() -> bool:
     """Return whether the tripwire is currently enabled.
@@ -187,13 +215,24 @@ def is_enabled() -> bool:
        loaded (heuristic: ``pytest`` in ``sys.modules``). Production
        deploys never import pytest, so this defaults to off there.
     """
-    raw = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP", "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    # Auto: default-on under pytest, default-off otherwise.
-    return "pytest" in sys.modules
+    override = _enabled_override.get()
+    if override is not None:
+        return override
+    return resolve_env_default()
+
+
+@contextmanager
+def strict_state_ownership(enabled: bool | None) -> Iterator[None]:
+    """Apply a typed state-ownership policy within the current async context.
+
+    ``None`` preserves the legacy environment and pytest fallback. A concrete
+    value wins over that fallback and is restored when the context exits.
+    """
+    token = _enabled_override.set(enabled)
+    try:
+        yield
+    finally:
+        _enabled_override.reset(token)
 
 
 def enable() -> None:

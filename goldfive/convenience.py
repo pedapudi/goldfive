@@ -218,11 +218,10 @@ def wrap(
         dynamic resolution). Ignored for non-ADK agents.
     runtime:
         Optional :class:`~goldfive.config.RuntimeConfig` (goldfive#225)
-        bundling the typed-config surfaces: embedding backend,
-        tool-loop detector thresholds, reasoning-drift thresholds,
-        goal-drift scheduling, and (added in the silent-disarm
-        follow-up) a dedicated :class:`~goldfive.config.JudgeConfig`
-        for routing the two drift judges to their own LLM endpoint.
+        bundling embedding, detector, steering, fail-fast, state-ownership,
+        and judge-endpoint settings. The dedicated
+        :class:`~goldfive.config.JudgeConfig` routes the two built-in drift
+        judges to their own LLM endpoint.
         When ``None`` (the default) ``wrap()``
         builds an instance from the environment via
         :meth:`RuntimeConfig.from_env` so pre-#225 callers get
@@ -586,6 +585,7 @@ def wrap(
     resolved_executor: Executor = executor or SequentialExecutor(
         max_task_invocations=max_task_invocations,
         overlay_mode=True,
+        fail_fast_on_invoke_cancel=resolved_runtime.fail_fast_on_invoke_cancel,
     )
     # Wire the resolved call_llm into the default steerer so the
     # trajectory-level GOAL_DRIFT judge (goldfive#143) actually fires.
@@ -683,6 +683,10 @@ def wrap(
         control=control,
         max_task_invocations=max_task_invocations,
         drift_self_reporting=drift_self_reporting,
+        fail_fast_on_revision_rejection=(
+            resolved_runtime.fail_fast_on_revision_rejection
+        ),
+        strict_state_ownership=resolved_runtime.strict_state_ownership,
     )
 
     # When the judges were routed through a dedicated JudgeConfig

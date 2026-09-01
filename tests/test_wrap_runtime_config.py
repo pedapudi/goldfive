@@ -28,12 +28,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 import goldfive  # noqa: E402
+from goldfive import _state_audit  # noqa: E402
 from goldfive.config import (  # noqa: E402
     EmbeddingConfig,
     GoalDriftConfig,
     JudgeConfig,
     ReasoningDriftConfig,
     RuntimeConfig,
+    SteeringConfig,
     ToolLoopConfig,
 )
 from goldfive.drift import _embed  # noqa: E402
@@ -92,6 +94,13 @@ def test_wrap_threads_runtime_config() -> None:
             looping_reasoning_hash_window=9,
         ),
         goal_drift=GoalDriftConfig(check_interval=8, activity_window=25),
+        steering=SteeringConfig(
+            capability_rule_a_enabled=True,
+            capability_rule_c_enabled=True,
+        ),
+        fail_fast_on_revision_rejection=True,
+        fail_fast_on_invoke_cancel=True,
+        strict_state_ownership=True,
     )
     runner = goldfive.wrap(_noop_agent, runtime=cfg, sinks=[])
 
@@ -124,6 +133,86 @@ def test_wrap_threads_runtime_config() -> None:
     assert steerer._goal_drift_config is cfg.goal_drift
     # Mode flows from the config into the steerer.
     assert steerer._reasoning_drift_mode == "judge"
+    assert steerer._steering_config is cfg.steering
+
+    # Runner and the wrap-owned executor receive the behavior policies.
+    assert runner._fail_fast_on_revision_rejection is True
+    assert runner._strict_state_ownership is True
+    assert runner.executor._fail_fast_on_invoke_cancel is True
+
+
+def test_explicit_executor_keeps_its_own_invoke_cancel_policy() -> None:
+    """RuntimeConfig configures only the executor constructed by wrap()."""
+    from goldfive.executors.sequential import SequentialExecutor
+
+    executor = SequentialExecutor(fail_fast_on_invoke_cancel=False)
+    runner = goldfive.wrap(
+        _noop_agent,
+        executor=executor,
+        runtime=RuntimeConfig(fail_fast_on_invoke_cancel=True),
+        sinks=[],
+    )
+
+    assert runner.executor is executor
+    assert executor._fail_fast_on_invoke_cancel is False
+
+
+@pytest.mark.asyncio
+async def test_runner_applies_typed_state_ownership_policy_for_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concrete runtime policy wins over every matching environment switch."""
+    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "1")
+    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "1")
+    monkeypatch.setenv("GOLDFIVE_STRICT_STATE_OWNERSHIP", "1")
+    runner = goldfive.wrap(
+        _noop_agent,
+        runtime=RuntimeConfig(
+            fail_fast_on_revision_rejection=False,
+            fail_fast_on_invoke_cancel=False,
+            strict_state_ownership=False,
+        ),
+        sinks=[],
+    )
+    assert runner._fail_fast_on_revision_rejection is False
+    assert runner.executor._fail_fast_on_invoke_cancel is False
+    observed: list[bool] = []
+
+    async def observe_policy(*args: Any, **kwargs: Any) -> Any:
+        observed.append(_state_audit.is_enabled())
+        return object()
+
+    monkeypatch.setattr(runner, "_run_locked", observe_policy)
+
+    await runner.run("test")
+
+    assert observed == [False]
+    assert _state_audit.is_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_omitted_runtime_policies_preserve_low_level_env_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` keeps legacy Runner and executor environment behavior."""
+    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "1")
+    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "1")
+    monkeypatch.setenv("GOLDFIVE_STRICT_STATE_OWNERSHIP", "1")
+    runner = goldfive.wrap(_noop_agent, runtime=RuntimeConfig(), sinks=[])
+
+    assert runner._fail_fast_on_revision_rejection is True
+    assert runner.executor._fail_fast_on_invoke_cancel is True
+    assert runner._strict_state_ownership is None
+    observed: list[bool] = []
+
+    async def observe_policy(*args: Any, **kwargs: Any) -> Any:
+        observed.append(_state_audit.is_enabled())
+        return object()
+
+    monkeypatch.setattr(runner, "_run_locked", observe_policy)
+    await runner.run("test")
+
+    assert observed == [True]
 
 
 def test_wrap_threads_reasoning_drift_mode_from_config() -> None:

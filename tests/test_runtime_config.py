@@ -4,8 +4,8 @@ Regression suite for goldfive#225. Covers:
 
 * Each sub-config's ``from_env`` classmethod reads every supported env
   var, and subsets fall back cleanly to field defaults.
-* ``RuntimeConfig.from_env`` aggregates the four sub-``from_env``
-  calls.
+* ``RuntimeConfig.from_env`` aggregates every sub-config and direct runtime
+  policy.
 * The dataclasses are mutable (``frozen=False``) so operators can
   tweak a field after constructing from env -- this is an intentional
   design choice called out in the module docstring.
@@ -26,6 +26,7 @@ from goldfive.config import (
     JudgeConfig,
     ReasoningDriftConfig,
     RuntimeConfig,
+    SteeringConfig,
     ToolLoopConfig,
 )
 
@@ -41,23 +42,26 @@ def test_embedding_config_defaults() -> None:
     assert cfg.model == ""
     assert cfg.api_key is None
     assert cfg.timeout_ms == 10_000
+    assert cfg.breaker_cooldown_s is None
 
 
 def test_embedding_config_from_env_all_vars(
     goldfive_embedding_env: Any,
 ) -> None:
-    """All four env vars map to the matching fields."""
+    """Every embedding env var maps to the matching field."""
     goldfive_embedding_env.set(
         base_url="http://llm.local:8080",
         model="qwen3-embed",
         api_key="secret-token",
         timeout_ms=2500,
+        breaker_cooldown_s=12.5,
     )
     cfg = EmbeddingConfig.from_env()
     assert cfg.base_url == "http://llm.local:8080"
     assert cfg.model == "qwen3-embed"
     assert cfg.api_key == "secret-token"
     assert cfg.timeout_ms == 2500
+    assert cfg.breaker_cooldown_s == 12.5
 
 
 def test_embedding_config_from_env_subset(
@@ -74,6 +78,7 @@ def test_embedding_config_from_env_subset(
     assert cfg.model == ""
     assert cfg.api_key is None
     assert cfg.timeout_ms == 10_000
+    assert cfg.breaker_cooldown_s == 60.0
 
 
 def test_embedding_config_empty_base_url_is_none(
@@ -335,6 +340,29 @@ def test_judge_config_empty_base_url_is_none(
 # ---------------------------------------------------------------------------
 
 
+def test_steering_config_capability_rules_from_env(
+    goldfive_steer_env: Any,
+) -> None:
+    """The soft-retired capability rules are explicit steering policy."""
+    goldfive_steer_env.set(
+        capability_rule_a_enabled="yes",
+        capability_rule_c_enabled="on",
+    )
+
+    cfg = SteeringConfig.from_env()
+
+    assert cfg.capability_rule_a_enabled is True
+    assert cfg.capability_rule_c_enabled is True
+
+
+def test_steering_capability_rule_defaults_preserve_direct_env_fallback() -> None:
+    """Unset typed policy lets direct steerer users retain legacy env control."""
+    cfg = SteeringConfig()
+
+    assert cfg.capability_rule_a_enabled is None
+    assert cfg.capability_rule_c_enabled is None
+
+
 def test_runtime_config_defaults() -> None:
     """Default aggregate composes defaults of each sub-config."""
     cfg = RuntimeConfig()
@@ -343,6 +371,9 @@ def test_runtime_config_defaults() -> None:
     assert cfg.reasoning_drift == ReasoningDriftConfig()
     assert cfg.goal_drift == GoalDriftConfig()
     assert cfg.judge == JudgeConfig()
+    assert cfg.fail_fast_on_revision_rejection is None
+    assert cfg.fail_fast_on_invoke_cancel is None
+    assert cfg.strict_state_ownership is None
 
 
 def test_runtime_config_includes_judge() -> None:
@@ -397,3 +428,25 @@ def test_runtime_config_equality_and_mutable_semantics() -> None:
     )
     assert derived.goal_drift.check_interval == 42
     assert b.goal_drift.check_interval == 5  # untouched
+
+
+def test_runtime_config_from_env_preserves_legacy_fail_fast_literals(
+    goldfive_fail_fast_env: Any,
+) -> None:
+    """Only the legacy exact string ``"1"`` enables fail-fast behavior."""
+    goldfive_fail_fast_env.set(revision_rejection="true", invoke_cancel="1")
+
+    cfg = RuntimeConfig.from_env()
+
+    assert cfg.fail_fast_on_revision_rejection is False
+    assert cfg.fail_fast_on_invoke_cancel is True
+
+
+def test_runtime_config_from_env_resolves_strict_state_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate captures the legacy tri-state ownership policy."""
+    monkeypatch.setenv("GOLDFIVE_STRICT_STATE_OWNERSHIP", "0")
+    assert RuntimeConfig.from_env().strict_state_ownership is False
+    monkeypatch.setenv("GOLDFIVE_STRICT_STATE_OWNERSHIP", "yes")
+    assert RuntimeConfig.from_env().strict_state_ownership is True

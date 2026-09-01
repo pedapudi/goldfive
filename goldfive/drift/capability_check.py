@@ -342,6 +342,8 @@ def detect_capability_mismatch(
     invoked_agent_tools: list[Any],
     task: Task,
     all_pending_tasks: Sequence[Task] | None = None,
+    capability_rule_a_enabled: bool | None = None,
+    capability_rule_c_enabled: bool | None = None,
 ) -> DriftEvent | None:
     """Return a CAPABILITY_MISMATCH drift if ``invoked_agent_name`` cannot perform ``task``.
 
@@ -368,6 +370,12 @@ def detect_capability_mismatch(
         soft-retired and additionally requires
         ``GOLDFIVE_CAPABILITY_RULE_C=1`` to run at all (goldfive#423 /
         AGENCY-PRESERVATION.md PR 2).
+    capability_rule_a_enabled:
+        Explicit Rule A policy. ``None`` preserves the legacy environment
+        fallback for direct detector callers.
+    capability_rule_c_enabled:
+        Explicit Rule C policy. ``None`` preserves the legacy environment
+        fallback for direct detector callers.
 
     Returns
     -------
@@ -433,7 +441,12 @@ def detect_capability_mismatch(
     # not steering. Hard deletion follows in PR 13. Empty tool list does
     # not trip Rule A regardless: we cannot distinguish "agent has no
     # tools" from "test stub / introspection failure".
-    if _rule_a_enabled() and tools and all(is_agent_tool(t) for t in tools):
+    rule_a_enabled = (
+        _rule_a_enabled()
+        if capability_rule_a_enabled is None
+        else capability_rule_a_enabled
+    )
+    if rule_a_enabled and tools and all(is_agent_tool(t) for t in tools):
         if not _looks_like_delegation_task(task):
             detail = (
                 f"agent {invoked_agent_name!r} has only AgentTool "
@@ -474,7 +487,12 @@ def detect_capability_mismatch(
     # names degrade gracefully), or when no other PENDING task
     # mentions the stem (in which case Rule C has nothing to say — the
     # pin is just doing its best with a generic agent).
-    if _rule_c_enabled():
+    rule_c_enabled = (
+        _rule_c_enabled()
+        if capability_rule_c_enabled is None
+        else capability_rule_c_enabled
+    )
+    if rule_c_enabled:
         drift_c = _rule_c_dag_order(
             invoked_agent_name=invoked_agent_name,
             bound_task=task,

@@ -237,7 +237,7 @@ cost honesty.
 object and knob: the env-parse helpers (reuse them), `SteeringConfig`,
 `AgentConfig`, `ReasoningDriftConfig`, `ToolLoopConfig`, `GoalDriftConfig`,
 `EmbeddingConfig`, `JudgeConfig`, `wrap()` / `Runner` / executor / steerer
-kwargs, standalone env vars, the `_llm.py` knob surface (#491), the
+kwargs, low-level environment compatibility fallbacks, the `_llm.py` knob surface (#491), the
 `GOLDFIVE_*` names that are NOT env vars, `optimization/manifest.toml` (the
 zicato-facing inventory), precedence rules, the sign-off-gated frozen defaults,
 and a worked "add a knob end-to-end" example.

@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from goldfive.config import EmbeddingConfig
 from goldfive.drift import _embed
 
 
@@ -615,6 +616,19 @@ def test_circuit_breaker_cooldown_env_override(
     assert _embed._get_model() is None
     clock["t"] += 1.5
     assert _embed._get_model() is failing
+
+
+def test_typed_circuit_breaker_cooldown_wins_over_environment(
+    goldfive_embedding_env: Any,
+) -> None:
+    """An installed EmbeddingConfig is authoritative for the cooldown."""
+    goldfive_embedding_env.set(breaker_cooldown_s="5")
+    _embed.configure(EmbeddingConfig(breaker_cooldown_s=17.5))
+
+    assert _embed._recovery_cooldown_s() == 17.5
+
+    _embed.configure(EmbeddingConfig())
+    assert _embed._recovery_cooldown_s() == 5.0
 
 
 def test_import_unavailability_has_no_timed_recovery(

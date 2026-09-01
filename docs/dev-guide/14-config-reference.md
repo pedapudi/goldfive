@@ -61,6 +61,9 @@ class RuntimeConfig:
     judge: JudgeConfig
     steering: SteeringConfig
     agent: AgentConfig
+    fail_fast_on_revision_rejection: bool | None
+    fail_fast_on_invoke_cancel: bool | None
+    strict_state_ownership: bool | None
 ```
 
 Every sub-config is a **mutable** (`frozen=False`) dataclass with:
@@ -87,6 +90,9 @@ _tool_loops_module.configure(resolved_runtime.tool_loops)
 - If `runtime=` is omitted (the common case), `wrap()` calls `RuntimeConfig.from_env()`, so a bare `wrap(tree)` is byte-identical to pre-#225 env-driven behaviour.
 - The `embedding`, `reasoning_drift`, and `tool_loops` sub-configs are installed **process-wide** via their module `configure()`.
 - `agent`, `steering`, `goal_drift`, `judge` are threaded into the ADK adapter and the `DefaultSteerer` per-Runner (see the wrap kwargs section).
+- The two fail-fast fields are passed to the `Runner` and the wrap-owned
+  `SequentialExecutor`. `strict_state_ownership` is applied by the `Runner`
+  for the complete async run lifecycle.
 
 **Dataclasses are deliberately mutable.** The `config.py` module docstring blesses the pattern of "load defaults from env, then bump one field for a debugging run". If you want a snapshot, `dataclasses.replace(...)` a variant rather than mutating the source.
 
@@ -103,6 +109,9 @@ Tracing `resolved_runtime` through `goldfive/convenience.py` `wrap()`, each of t
 | `judge` | judge routing in `wrap()` | `resolved_runtime.judge.base_url` selects the judge endpoint when neither explicit callable route is present | per-Runner |
 | `steering` | `ContextEditor` build + `DefaultSteerer` | `build_editor_from_config(...context_editor_rules...)` AND steerer kwarg `steering_config=` | per-Runner |
 | `agent` | ADK adapter | `auto_adapter(..., llm_call_timeout_ms=resolved_runtime.agent.call_timeout_ms, agent_max_output_tokens=resolved_runtime.agent.max_output_tokens)` | per-Runner (ADK only) |
+| `fail_fast_on_revision_rejection` | `Runner` | constructor kwarg | per-Runner |
+| `fail_fast_on_invoke_cancel` | wrap-owned `SequentialExecutor` | constructor kwarg; caller-supplied executors retain their own policy | per-executor |
+| `strict_state_ownership` | `Runner.run` | context-local policy around the complete run | per-Runner and safe across concurrent async tasks |
 
 Note `reasoning_drift` and `tool_loops` are threaded TWICE — once process-wide into their detector modules (thresholds the deterministic detectors read) and once into the steerer (which owns the reasoning-judge scheduling and tool-loop tracker construction). This is why an explicit `steerer=` still gets the process-wide detector thresholds but NOT the steerer-side scheduling config. `agent` is ADK-only — the Claude / callable adapters ignore `llm_call_timeout_ms` / `agent_max_output_tokens` (no analogous surface today).
 
@@ -110,20 +119,30 @@ Note `reasoning_drift` and `tool_loops` are threaded TWICE — once process-wide
 
 | Pattern | Code | When |
 |---|---|---|
-| All defaults | `RuntimeConfig()` | You want the shipped defaults, ignoring env. NOT the same as omitting `runtime=` (that reads env). |
+| All defaults | `RuntimeConfig()` | Use shipped defaults. The six legacy behavior fields remain `None`, so their existing low-level env fallbacks still apply. |
 | From env | `RuntimeConfig.from_env()` | Reproduce the `wrap(tree)` (no `runtime=`) behaviour explicitly, e.g. to inspect what env resolved to. |
 | From env, then tweak | `cfg = RuntimeConfig.from_env(); cfg.steering.threshold = "critical"` | The blessed debugging pattern — dataclasses are mutable by design. |
 | Snapshot variant | `dataclasses.replace(cfg, steering=SteeringConfig(observation_only=False))` | You want a variant WITHOUT mutating the source (e.g. two Runners from one base). |
 
-A subtlety: `RuntimeConfig()` and `RuntimeConfig.from_env()` differ ONLY when a `GOLDFIVE_*` env var is set — with a clean environment they produce identical objects. `wrap(tree)` with no `runtime=` uses `from_env()`, so it honours the env; `wrap(tree, runtime=RuntimeConfig())` deliberately IGNORES the env. This is the single most common config surprise (see §22 debugging step 1).
+A subtlety: `wrap(tree)` with no `runtime=` uses `RuntimeConfig.from_env()`,
+which resolves every supported environment setting. Passing
+`wrap(tree, runtime=RuntimeConfig())` bypasses `from_env()` and ignores the
+environment for most fields. Six legacy behavior fields are deliberate
+exceptions because their `None` defaults preserve the fallback that existed
+before the typed field: the embedding-breaker cooldown, capability Rules A and
+C, revision-rejection fail-fast, invoke-cancel fail-fast, and strict state
+ownership. Set any of those fields to a concrete value to override its
+environment fallback. With no relevant environment setting, their effective
+production behavior matches the built-in defaults even though the raw default
+objects contain `None` (see §22 debugging step 1).
 
 ### Precedence, in one sentence
 
-Most knobs use **explicit kwarg > explicit `RuntimeConfig` or
-config-object field > `GOLDFIVE_*` env var > built-in default**. The
-documented exceptions include `Runner`'s two `bool | None` fail-fast
-kwargs, where the env is consulted only when the kwarg is `None`.
-Judge-callable routing also has its own precedence order.
+Most knobs use **explicit kwarg > explicit `RuntimeConfig` or config-object
+field > `GOLDFIVE_*` env var > built-in default**. For the six legacy fields
+listed above, a concrete typed value is explicit and wins; `None` means
+"consult the legacy fallback." Judge-callable routing has its own precedence
+order.
 
 ### Master environment-variable index
 
@@ -134,8 +153,17 @@ Every environment variable goldfive reads, in one place. The "Owner" column tell
 | `GOLDFIVE_STEER_THRESHOLD` | §3 `SteeringConfig` | `off`/`warning`/`critical` | `warning` | `_read_steer_threshold_env` |
 | `GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS` | §3 | int | `3` | `_read_int_env` |
 | `GOLDFIVE_STEER_OBSERVATION_ONLY` | §3 | bool | `True` (FROZEN) | `_read_bool_env` |
+| `GOLDFIVE_CAPABILITY_RULE_A` | §3 | bool | `False` | `_read_bool_env` |
+| `GOLDFIVE_CAPABILITY_RULE_C` | §3 | bool | `False` | `_read_bool_env` |
 | `GOLDFIVE_STEER_CONTEXT_EDITOR_RULES` | §3 | csv | `None` | inline comma-split |
 | `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH` | §3 | bool | `False` | `_read_bool_env` |
+| `GOLDFIVE_STEER_SIGNAL_TELEMETRY` | §3 | bool | `False` | `_read_bool_env` |
+| `GOLDFIVE_CANCEL_INFLIGHT_SCOPE` | §3 | `user_and_safety`/`all` | `user_and_safety` | `_read_cancel_inflight_scope_env` |
+| `GOLDFIVE_STEER_SIGNAL_CHANNEL` | §3 | `legacy_user_message`/`request_context` | `legacy_user_message` | `_read_signal_channel_env` |
+| `GOLDFIVE_PLAN_MODE` | §3 | `forecast`/`ledger` | `forecast` | `_read_plan_mode_env` |
+| `GOLDFIVE_STEER_LEGACY_LADDER` | §3 | bool | `False` | `_read_bool_env` |
+| `GOLDFIVE_STEER_PIN_ASSIGNED_TASK` | §3 | bool | `False` | `_read_bool_env` |
+| `GOLDFIVE_STEER_GRACE_WINDOW_TURNS` | §3 | int | `3` | `_read_int_env` |
 | `GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS` | §3 | int | `600000` | `_read_int_env` |
 | `GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S` | §3 | float\|None | `None` | `_read_optional_float_env` |
 | `GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED` | §3 | bool | `False` | `_read_bool_env` |
@@ -163,7 +191,7 @@ Every environment variable goldfive reads, in one place. The "Owner" column tell
 | `GOLDFIVE_EMBEDDING_MODEL` | §8 | str | `""` | `_read_str_env` |
 | `GOLDFIVE_EMBEDDING_API_KEY` | §8 | str\|None | `None` | `_read_optional_str_env` |
 | `GOLDFIVE_EMBEDDING_TIMEOUT_MS` | §8 | int | `10000` | `_read_int_env` |
-| `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` | §14 | float | `60.0` | inline `float()` |
+| `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` | §8 | float | `60.0` | `_read_float_env` |
 | `GOLDFIVE_JUDGE_BASE_URL` | §9 `JudgeConfig` | str\|None | `None` | `_read_optional_str_env` |
 | `GOLDFIVE_JUDGE_MODEL` | §9 | str | `""` | `_read_str_env` |
 | `GOLDFIVE_JUDGE_API_KEY` | §9 | str\|None | `None` | `_read_optional_str_env` |
@@ -172,7 +200,7 @@ Every environment variable goldfive reads, in one place. The "Owner" column tell
 | `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL` | §14 | `"1"`/else | off | inline `== "1"` |
 | `GOLDFIVE_STRICT_STATE_OWNERSHIP` | §14 | tri-state | auto (on under pytest) | inline |
 
-That is the complete list — 40 environment variables. The `_read_*` readers all live in `goldfive/config.py`; `_read_severity_env` lives in `goldfive/drift/tool_loops.py`; the "inline" readers are the four documented exceptions plus `_embed`'s breaker cooldown.
+That is the complete list — 49 environment variables. The `_read_*` readers all live in `goldfive/config.py`; `_read_severity_env` lives in `goldfive/drift/tool_loops.py`. The fail-fast variables retain exact-`"1"` compatibility parsing, and strict state ownership retains its tri-state resolver.
 
 ---
 
@@ -263,8 +291,17 @@ def _read_optional_float_env(name: str, default: float | None) -> float | None:
 | `threshold` | `str` | `"warning"` | `GOLDFIVE_STEER_THRESHOLD` | `_read_steer_threshold_env` |
 | `suppression_window_turns` | `int` | `3` | `GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS` | `_read_int_env` |
 | `observation_only` | `bool` | `True` | `GOLDFIVE_STEER_OBSERVATION_ONLY` | `_read_bool_env` |
+| `capability_rule_a_enabled` | `bool \| None` | `None` (effective `False`) | `GOLDFIVE_CAPABILITY_RULE_A` | `_read_bool_env` |
+| `capability_rule_c_enabled` | `bool \| None` | `None` (effective `False`) | `GOLDFIVE_CAPABILITY_RULE_C` | `_read_bool_env` |
 | `context_editor_rules` | `list[str] \| None` | `None` | `GOLDFIVE_STEER_CONTEXT_EDITOR_RULES` | comma-split (bespoke, see below) |
 | `descriptive_growth_enabled` | `bool` | `False` | `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH` | `_read_bool_env` |
+| `signal_telemetry` | `bool` | `False` | `GOLDFIVE_STEER_SIGNAL_TELEMETRY` | `_read_bool_env` |
+| `cancel_inflight_scope` | `str` | `"user_and_safety"` | `GOLDFIVE_CANCEL_INFLIGHT_SCOPE` | `_read_cancel_inflight_scope_env` |
+| `signal_channel` | `str` | `"legacy_user_message"` | `GOLDFIVE_STEER_SIGNAL_CHANNEL` | `_read_signal_channel_env` |
+| `plan_mode` | `str` | `"forecast"` | `GOLDFIVE_PLAN_MODE` | `_read_plan_mode_env` |
+| `legacy_ladder` | `bool` | `False` | `GOLDFIVE_STEER_LEGACY_LADDER` | `_read_bool_env` |
+| `pin_assigned_task` | `bool` | `False` | `GOLDFIVE_STEER_PIN_ASSIGNED_TASK` | `_read_bool_env` |
+| `grace_window_turns` | `int` | `3` | `GOLDFIVE_STEER_GRACE_WINDOW_TURNS` | `_read_int_env` |
 | `approval_default_timeout_ms` | `int` | `600_000` | `GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS` | `_read_int_env` |
 | `pause_escalate_deadline_s` | `float \| None` | `None` | `GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S` | `_read_optional_float_env` |
 | `stall_watchdog_enabled` | `bool` | `False` | `GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED` | `_read_bool_env` |
@@ -284,6 +321,15 @@ def _read_optional_float_env(name: str, default: float | None) -> float | None:
 - the Level-2 nudge enqueues onto `session.pending_nudges` (`_dispatch_nudge` + the post-ABSORB handoff, goldfive#202); the executor drain carries a matching defense-in-depth gate (goldfive#264 pattern).
 
 Three revision categories always land even under `observation_only=True`: **bootstrap** (first install on a cold session, `prev is None`), **user-authored** (operator `ControlMessage` STEER, `drift.authored_by == "user"`), and **discovery** (`DriftKind.NEW_WORK_DISCOVERED`, goldfive#258). At runtime the flag is read ONLY through `DefaultSteerer.is_active_steering()` / `steering_is_active(steerer)` (missing / `None` / raising → PASSIVE). See invariant 5 and `09-steering-ladder-and-gates.md`.
+
+**`capability_rule_a_enabled` and `capability_rule_c_enabled`** — opt in to
+two soft-retired, text-heuristic `CAPABILITY_MISMATCH` signals. Rule A infers
+whether an AgentTool-only agent received a leaf task. Rule C compares the
+invoked agent's name with other pending task text. `None` preserves the legacy
+environment fallback for direct steerer and detector callers; without an
+environment value, the effective default is `False`. Explicit `True` or `False`
+is authoritative. `RuntimeConfig.from_env()` resolves both fields to concrete
+booleans before the default steerer carries them to the ADK plugin.
 
 **`context_editor_rules`** (goldfive#397) — names of `ContextEditRule`s to register on the ADK plugin's `ContextEditor`. `None` (default) AND `[]` both leave the editor unwired (zero overhead — `wrap()` never even builds the editor). Set to e.g. `["prune_cancelled_reasoning"]` to opt in. Unknown names are logged and dropped at registration. Per-rule (not one master switch) so a single rule's e2e regression can be bisected. The env reader is a **deliberate exception** to "reuse a helper": comma-separated splitting with empty→`None` collapse, inline in `from_env`:
 
@@ -442,6 +488,7 @@ logs a WARNING that LLM-as-a-judge detection is disabled for the Runner.
 | `model` | `str` | `""` | `GOLDFIVE_EMBEDDING_MODEL` | `_read_str_env` |
 | `api_key` | `str \| None` | `None` | `GOLDFIVE_EMBEDDING_API_KEY` | `_read_optional_str_env` |
 | `timeout_ms` | `int` | `10_000` | `GOLDFIVE_EMBEDDING_TIMEOUT_MS` | `_read_int_env` |
+| `breaker_cooldown_s` | `float \| None` | `None` (effective `60.0`) | `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` | `_read_float_env` |
 
 - `base_url = None` → the OpenAI-compatible HTTP backend is skipped and the lazy-load path falls through to sentence-transformers (if the `goldfive[embedding]` extra is installed).
 - `base_url` set → HTTP backend used exclusively, **no silent fall-through** to sentence-transformers on HTTP failure (matches the pre-#225 env-driven contract).
@@ -458,7 +505,7 @@ Backend resolution order at first encode:
 2. `base_url` unset + `goldfive[embedding]` extra installed → sentence-transformers (local).
 3. Neither → the detectors degrade to no-signal (they cannot embed).
 
-The circuit breaker (`_embed.py`) protects against a flapping HTTP backend: after `_RUNTIME_FAILURE_THRESHOLD` (3) consecutive failures the breaker TRIPS and the detectors degrade to no-signal rather than blocking the run on a dead endpoint. After `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` (default `_RUNTIME_RECOVERY_COOLDOWN_S = 60.0`s) it half-opens and retries one call; success closes it, failure re-trips (the half-open recovery hardened in #479). None of the breaker knobs are on `EmbeddingConfig` — `_RUNTIME_FAILURE_THRESHOLD` and `_CACHE_MAX` are manifest-tunable module constants; the cooldown is the standalone env var in §14.
+The circuit breaker (`_embed.py`) protects against a flapping HTTP backend: after `_RUNTIME_FAILURE_THRESHOLD` (3) consecutive failures the breaker TRIPS and the detectors degrade to no-signal rather than blocking the run on a dead endpoint. After the effective `EmbeddingConfig.breaker_cooldown_s` it half-opens and retries one call; success closes it, failure re-trips. A concrete typed value wins over the legacy direct-module environment fallback. `None` retains that fallback, whose built-in default is `60.0` seconds. `_RUNTIME_FAILURE_THRESHOLD` and `_CACHE_MAX` remain manifest-tunable module constants.
 
 ---
 
@@ -599,6 +646,7 @@ Constructed by `wrap()`, but usable directly. Keyword-only.
 | `planner_gate` | `Any` | `"auto"` | Gate controlling when the planner is consulted. See `10-planning-and-revision.md`. |
 | `drift_self_reporting` | `bool \| list[str]` | `False` | See the `wrap()` table + `13-reporting-tools-and-approval.md`. |
 | `fail_fast_on_revision_rejection` | `bool \| None` | `None` | Strict-abort opt-in for goldfive-authored revisions failing `Plan.validate(for_revision=True, prior=...)`. See below. |
+| `strict_state_ownership` | `bool \| None` | `None` | Context-local state and plan ownership tripwire. `None` retains the direct-constructor env/pytest fallback. |
 | `**legacy_kwargs` | — | — | Reserved; unexpected kwargs raise. |
 
 **`fail_fast_on_revision_rejection`** — the one `Runner` env-with-kwarg-override knob. `None` (default) → consult `GOLDFIVE_FAIL_FAST_REVISION_REJECTION` (`"1"` → `True`, else `False`). Explicit `True`/`False` from the kwarg ALWAYS wins over the env (so tests pin behaviour without unsetting the env). Default behaviour (`False`): a goldfive-authored autonomous refine producing an invalid revision keeps the existing `session.plan`, emits a `HUMAN_INTERVENTION_REQUIRED` INFO `DriftDetected`, and continues; the `REFINE_FAILURE_THRESHOLD=2` escalation still fires after two consecutive `(kind, task_id)` failures. `True` → strict abort (CI / regression / debug). **User-authored `USER_STEER` drifts are NEVER gated by this flag** — `DefaultSteerer.install_user_steer` guarantees a valid `Plan` even when the LLM revision fails validation (PLAN-LIFECYCLE.md §4.2.1/§4.5.1).
@@ -752,16 +800,19 @@ If you need one of these operator-configurable, that is a `RuntimeConfig` extens
 
 ---
 
-## 14. Standalone env vars (NOT on any config object)
+## 14. Low-level compatibility fallbacks
 
-These are read directly via `os.environ`, outside the `RuntimeConfig` surface.
+All behavior-bearing settings in this section are represented in typed runtime
+configuration. The low-level consumers still read the original environment
+variables when constructed or called directly without an explicit typed value.
 
 | Env var | Read at | Default / semantics |
 |---|---|---|
 | `GOLDFIVE_FAIL_FAST_REVISION_REJECTION` | `goldfive/runner.py` (`Runner.__init__`) | `"1"` → strict abort on invalid goldfive-authored revision; else non-fatal. Only consulted when the `fail_fast_on_revision_rejection` kwarg is `None`. |
 | `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL` | `goldfive/executors/sequential.py` | `"1"` → abort on goldfive-internal supersede-cancel; else continue. Only when the kwarg is `None`. |
-| `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` | `goldfive/drift/_embed.py` (`_recovery_cooldown_s`) | Float override for the embedding circuit-breaker half-open cooldown; falls back to `_RUNTIME_RECOVERY_COOLDOWN_S = 60.0`. Not on `EmbeddingConfig`. |
-| `GOLDFIVE_STRICT_STATE_OWNERSHIP` | `goldfive/types.py` (`is_strict_state_ownership`) + `goldfive/_state_audit.py` (`is_enabled`) | Tri-state: `1/true/yes/on` → force-on; `0/false/no/off` → force-off; unset/`auto`/other → auto (on iff `pytest` in `sys.modules`, i.e. on under tests, off in production). Guards the single-writer `Session.plan` tripwire. |
+| `GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S` | `goldfive/drift/_embed.py` (`_recovery_cooldown_s`) | Used only when no `EmbeddingConfig` is installed. |
+| `GOLDFIVE_STRICT_STATE_OWNERSHIP` | `goldfive/_state_audit.py` (`is_enabled`) | Used when no per-Runner override is active. Tri-state: `1/true/yes/on` → force-on; `0/false/no/off` → force-off; unset/`auto`/other → auto (on under pytest, off otherwise). |
+| `GOLDFIVE_CAPABILITY_RULE_A`, `GOLDFIVE_CAPABILITY_RULE_C` | `goldfive/drift/capability_check.py` | Used only when a direct detector caller omits the corresponding explicit policy. |
 
 **Circuit-breaker constants** in `_embed.py` (not env, but tunable via the manifest): `_RUNTIME_FAILURE_THRESHOLD = 3` (consecutive backend failures before the breaker trips → detectors degrade to no-signal), `_RUNTIME_RECOVERY_COOLDOWN_S = 60.0` (half-open cooldown), `_CACHE_MAX = 512` (per-text encode LRU size). See `07-deterministic-drift-detection.md` for the half-open recovery behaviour (#479).
 
@@ -1033,10 +1084,12 @@ The general rule is **explicit kwarg > config-object field > env var > built-in 
 | LLM and judge routing | `wrap()` | Built-in judges use `judge_call_llm=` > `call_llm=` > `JudgeConfig.base_url` > detected tree LLM. `judge_model=` overrides the judge model name. The planner and goal deriver stay on `call_llm` or the detected tree LLM. |
 | `fail_fast_on_revision_rejection` | `Runner.__init__` | kwarg `True`/`False` > env `GOLDFIVE_FAIL_FAST_REVISION_REJECTION` (only when kwarg is `None`) > default `False`. |
 | `fail_fast_on_invoke_cancel` | `SequentialExecutor.__init__` | kwarg `True`/`False` > env `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL` (only when kwarg is `None`) > default `False`. |
+| `strict_state_ownership` | `Runner.run` | Runner kwarg `True`/`False` > tri-state env/pytest fallback when the kwarg is `None`. `wrap()` passes the resolved `RuntimeConfig` field. |
+| Capability Rules A and C | ADK plugin → detector | `SteeringConfig` field > direct-detector env fallback > default `False`. |
 | `report_awaiting_approval` timeout | handler | explicit positive `timeout_ms` arg > `SteeringConfig.approval_default_timeout_ms` > `DEFAULT_APPROVAL_TIMEOUT_MS` (when config value non-positive). |
 | `pause_escalate_deadline_s` | executor | config value (`None` = block forever for L4); Level 5 falls back to `DEFAULT_TERMINATE_PAUSE_DEADLINE_S` when `None`. |
 | `AgentConfig.max_output_tokens` | ADK plugin `before_model_callback` | ratchet-DOWN only: a smaller sub-agent / ADK value wins over the config ceiling. |
-| `GOLDFIVE_STRICT_STATE_OWNERSHIP` | `types.py` / `_state_audit.py` | explicit `1`/`0` > auto (`pytest in sys.modules`). |
+| `GOLDFIVE_STRICT_STATE_OWNERSHIP` | `_state_audit.py` | per-Runner typed value > explicit env value > auto (`pytest in sys.modules`). |
 
 ### Worked precedence resolutions
 
@@ -1073,7 +1126,7 @@ The general rule is **explicit kwarg > config-object field > env var > built-in 
 |---|---|---|
 | `goldfive.drift.reasoning.configure(config)` | `ReasoningDriftConfig` → module `_CONFIG` | `configure(None)` → helpers fall back to module constants |
 | `goldfive.drift.tool_loops.configure(config)` | `ToolLoopConfig` | `configure(None)` |
-| `goldfive.drift._embed.configure(config)` | `EmbeddingConfig` (base_url/model/api_key/timeout) | `configure(None)` |
+| `goldfive.drift._embed.configure(config)` | `EmbeddingConfig` (base_url/model/api_key/timeout/breaker cooldown) | `configure(None)` |
 
 Each is idempotent (last call wins) and takes `None` to clear the override — the documented test-teardown path so one test's thresholds don't leak into the next. The `configure` calls happen at the TOP of `wrap()` (before the steerer branch), so they run even when you pass your own `steerer=`. If you construct detectors directly in a test (bypassing `wrap()`), call `configure()` yourself or the detector reads the module constants. The reasoning detectors read through helper functions (`_off_topic_distance_threshold()`, `_looping_hash_window()`, etc.) that consult `_CONFIG` first — never read the module constant directly at a detector call site or you defeat the override.
 
@@ -1386,6 +1439,10 @@ You add `SteeringConfig.my_timeout_s` and a manifest entry but never wire it int
 You pass `wrap(tree, runtime=RuntimeConfig())` (all defaults) and also set `GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE=0.5` in the env, expecting `0.5`. It stays `0.7` — an explicit `runtime=` skips `from_env()` entirely.
 → **Correct:** either omit `runtime=` (env is read) or set the field on the `RuntimeConfig` you pass (`RuntimeConfig(reasoning_drift=ReasoningDriftConfig(off_topic_distance_threshold=0.5))`), or build from env then tweak: `cfg = RuntimeConfig.from_env(); cfg.reasoning_drift.off_topic_distance_threshold = 0.5`.
 
+The six legacy fields listed in §1 are the exception: their `None` defaults
+still delegate to the environment at the low-level consumer. Give those fields
+a concrete value when an explicit runtime must be independent of ambient state.
+
 **Mistake: expecting two Runners in one process to have independent reasoning/tool-loop/embedding thresholds.**
 `configure()` is process-global; the second `wrap()` clobbers the first.
 → **Correct:** run them in separate processes, or accept last-Runner-wins, or (if this becomes a real need) do the `Session`-scoped-config redesign — not an ad-hoc per-call thread.
@@ -1473,7 +1530,7 @@ grep -n "my_new_field" goldfive/config.py   # expect: the field def AND a line i
 grep -rhoE "GOLDFIVE_[A-Z_]+" goldfive/ | sort -u
 ```
 
-**5. Confirm no bespoke `os.environ` parse crept in (the only sanctioned raw reads are the fail-fast `== "1"` pair, the `context_editor_rules` split, the `_embed` breaker cooldown, `GOLDFIVE_STRICT_STATE_OWNERSHIP`, and `_embed`'s lazy backend reads):**
+**5. Confirm no bespoke `os.environ` parse crept in (the only sanctioned raw reads are the fail-fast exact-`"1"` pair, the `context_editor_rules` split, strict-state tri-state resolution, capability-detector compatibility fallbacks, and `_embed`'s lazy backend/cooldown fallbacks):**
 ```bash
 grep -rn "os.environ\|getenv" goldfive/ | grep -v "config.py\|_read_"
 ```
@@ -1522,6 +1579,7 @@ Every field of every sub-config, in one table, for quick lookup. `F` in the "Fro
 | `EmbeddingConfig` | `model` | `""` | |
 | `EmbeddingConfig` | `api_key` | `None` | |
 | `EmbeddingConfig` | `timeout_ms` | `10_000` | |
+| `EmbeddingConfig` | `breaker_cooldown_s` | `None` (effective `60.0`) | |
 | `JudgeConfig` | `base_url` | `None` | |
 | `JudgeConfig` | `model` | `""` | |
 | `JudgeConfig` | `api_key` | `None` | |
@@ -1546,14 +1604,26 @@ Every field of every sub-config, in one table, for quick lookup. `F` in the "Fro
 | `SteeringConfig` | `threshold` | `"warning"` | |
 | `SteeringConfig` | `suppression_window_turns` | `3` | |
 | `SteeringConfig` | `observation_only` | `True` | F |
+| `SteeringConfig` | `capability_rule_a_enabled` | `None` (effective `False`) | |
+| `SteeringConfig` | `capability_rule_c_enabled` | `None` (effective `False`) | |
 | `SteeringConfig` | `context_editor_rules` | `None` | |
 | `SteeringConfig` | `descriptive_growth_enabled` | `False` | F |
+| `SteeringConfig` | `signal_telemetry` | `False` | |
+| `SteeringConfig` | `cancel_inflight_scope` | `"user_and_safety"` | |
+| `SteeringConfig` | `signal_channel` | `"legacy_user_message"` | |
+| `SteeringConfig` | `plan_mode` | `"forecast"` | |
+| `SteeringConfig` | `legacy_ladder` | `False` | |
+| `SteeringConfig` | `pin_assigned_task` | `False` | |
+| `SteeringConfig` | `grace_window_turns` | `3` | |
 | `SteeringConfig` | `approval_default_timeout_ms` | `600_000` | |
 | `SteeringConfig` | `pause_escalate_deadline_s` | `None` | |
 | `SteeringConfig` | `stall_watchdog_enabled` | `False` | F |
 | `SteeringConfig` | `stall_timeout_s` | `600.0` | |
 | `AgentConfig` | `max_output_tokens` | `16384` | |
 | `AgentConfig` | `call_timeout_ms` | `120_000` | |
+| `RuntimeConfig` | `fail_fast_on_revision_rejection` | `None` (effective `False`) | |
+| `RuntimeConfig` | `fail_fast_on_invoke_cancel` | `None` (effective `False`) | |
+| `RuntimeConfig` | `strict_state_ownership` | `None` (env/pytest fallback) | |
 
 Module-level constants that back these (the "no config installed" fallbacks and the `configure`-overridable detector thresholds) live in `goldfive/drift/reasoning.py`, `goldfive/drift/tool_loops.py`, and `goldfive/drift/_embed.py`; the manifest §16 numeric table is the authoritative list of the tunable ones with their ranges.
 
@@ -1566,7 +1636,7 @@ Module-level constants that back these (the "no config installed" fallbacks and 
 - §11 — `Runner` kwargs; the `fail_fast_on_revision_rejection` env fallback.
 - §12 — executor kwargs + the class-attribute knob table.
 - §13 — `DefaultSteerer` kwargs; typed configs vs legacy scalars.
-- §14 / §14b — standalone env vars + the `_llm.py` per-call knob surface.
+- §14 / §14b — low-level environment compatibility fallbacks + the `_llm.py` per-call knob surface.
 - §15 — `GOLDFIVE_*` symbols that are NOT env vars.
 - §16 — the manifest: full numeric + prompt tables, AST liveness contract, loader/validator API.
 - §17 — precedence resolutions + the process-wide `configure()` caveat.

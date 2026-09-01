@@ -361,6 +361,8 @@ _STEER_ENV: dict[str, str] = {
     "observation_only": "GOLDFIVE_STEER_OBSERVATION_ONLY",
     "threshold": "GOLDFIVE_STEER_THRESHOLD",
     "suppression_window_turns": "GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS",
+    "capability_rule_a_enabled": "GOLDFIVE_CAPABILITY_RULE_A",
+    "capability_rule_c_enabled": "GOLDFIVE_CAPABILITY_RULE_C",
 }
 
 _TOOL_LOOP_ENV: dict[str, str] = {
@@ -443,6 +445,7 @@ def goldfive_runtime_env(
     goldfive_judge_env: _EnvController,
     goldfive_steer_env: _EnvController,
     goldfive_agent_env: _EnvController,
+    goldfive_fail_fast_env: _EnvController,
 ) -> dict[str, _EnvController]:
     """Bundle every ``RuntimeConfig`` sub-domain controller for tests
     that exercise the aggregate ``RuntimeConfig.from_env()`` path.
@@ -458,4 +461,5 @@ def goldfive_runtime_env(
         "judge": goldfive_judge_env,
         "steer": goldfive_steer_env,
         "agent": goldfive_agent_env,
+        "fail_fast": goldfive_fail_fast_env,
     }
