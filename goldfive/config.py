@@ -431,13 +431,14 @@ class JudgeConfig:
     as well; see the named-model WARNING in :func:`goldfive.wrap`
     for the guardrail that surfaces that inheritance.
 
-    When ``base_url`` is ``None`` (the default), the explicit
-    ``goldfive.wrap(call_llm=...)`` argument — or the auto-detected
-    tree LLM — is used for the judges. Precedence order:
+    When ``base_url`` is ``None`` (the default), an explicit judge
+    callable, the shared callable, or the auto-detected tree LLM is used.
+    The full precedence order is:
 
-    1. Explicit ``goldfive.wrap(call_llm=...)`` kwarg.
-    2. ``JudgeConfig.base_url``.
-    3. Auto-detected LLM from the agent (``detect_llm``).
+    1. Explicit ``goldfive.wrap(judge_call_llm=...)`` argument.
+    2. Explicit ``goldfive.wrap(call_llm=...)`` argument.
+    3. ``JudgeConfig.base_url``.
+    4. Auto-detected LLM from the agent (``detect_llm``).
     """
 
     base_url: str | None = None

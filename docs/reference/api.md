@@ -33,6 +33,9 @@ from goldfive import (
     DriftEvent, Session,
     # protocols
     GoalDeriver, Planner, Executor, Steerer, AgentAdapter, EventSink,
+    CallLLM, ClosableCallLLM,
+    # dedicated OpenAI-compatible call route
+    JudgeConfig, make_default_openai_call_llm, maybe_close_call_llm,
     # results
     InvocationResult, ExecutionOutcome,
     # reporting
@@ -67,6 +70,64 @@ from goldfive.adapters.auto import auto_adapter
 appear in `goldfive.__all__` unconditionally; when the extra is
 missing the module attribute resolves to `None` at import time,
 surfacing the missing dependency at construction rather than import.
+
+## OpenAI-compatible LLM callable
+
+```python
+def make_default_openai_call_llm(
+    config: JudgeConfig,
+) -> tuple[ClosableCallLLM, str] | None: ...
+
+async def maybe_close_call_llm(
+    call_llm: Any,
+    *,
+    label: str = "call_llm",
+) -> None: ...
+```
+
+`make_default_openai_call_llm` exposes Goldfive's OpenAI-compatible
+dispatch behavior for applications that manage a dedicated endpoint. It
+uses the same output-budget, thinking-suppression, compatibility-retry,
+and per-dispatch diagnostic logic as a judge endpoint created internally
+by `goldfive.wrap`.
+
+```python
+from goldfive import (
+    JudgeConfig,
+    make_default_openai_call_llm,
+    maybe_close_call_llm,
+    wrap,
+)
+
+built = make_default_openai_call_llm(
+    JudgeConfig(
+        base_url="http://127.0.0.1:8000",
+        model="qwen3-judge",
+        api_key="not-needed",
+        timeout_ms=10_000,
+    )
+)
+if built is None:
+    raise RuntimeError("the OpenAI-compatible judge client could not be created")
+
+judge_call_llm, judge_model = built
+runner = wrap(
+    agent,
+    judge_call_llm=judge_call_llm,
+    judge_model=judge_model,
+)
+try:
+    outcome = await runner.run("complete the request")
+finally:
+    await runner.close()
+    await maybe_close_call_llm(judge_call_llm, label="judge_call_llm")
+```
+
+The builder returns `None` when `base_url` is empty, the `openai` package
+cannot be imported, or client construction fails. It appends `/v1` to the
+configured base URL. The returned callable owns an asynchronous client;
+the application that calls the builder must close it. Passing the callable
+as `judge_call_llm` does not transfer ownership to the `Runner`.
 
 ## `goldfive.wrap` / `goldfive.run`
 
