@@ -667,9 +667,12 @@ Everything speaks the opaque async signature `(system, user, model) -> str`
 (`CallLLM`, a `runtime_checkable` `Protocol`). `ClosableCallLLM` extends it
 with an optional async `close()`; `maybe_close_call_llm` probes
 `getattr(call_llm, "close", None)` and awaits it if present, swallowing
-exceptions (`Runner.close` uses it). The signature is **opaque on purpose**
-— adding a `max_tokens` parameter would break every user-supplied callable
-— so per-call knobs travel through ContextVars.
+exceptions (`Runner.close` uses it for callables the Runner owns).
+`CallLLM`, `ClosableCallLLM`, and `maybe_close_call_llm` are public imports
+from `goldfive`. A caller that supplies a callable retains ownership unless
+the accepting API explicitly says otherwise. The signature is **opaque on
+purpose**. Adding a `max_tokens` parameter would break every user-supplied
+callable, so per-call knobs travel through ContextVars.
 
 ### 7.2 The three ContextVars
 
@@ -711,6 +714,13 @@ records leaves the counts at zero.
   "just work". On this OpenAI-compatible wire, thinking-disable is a
   **Qwen-family-only** hack (see §7.4). It reports `reasoning_content`
   presence as a 0/1 sentinel for `thought_count`.
+
+`JudgeConfig` and `make_default_openai_call_llm` are public imports from
+`goldfive`. This is the supported construction path for an application that
+wants Goldfive's OpenAI-compatible dispatch behavior while retaining endpoint
+ownership. The application must call `await maybe_close_call_llm(call_llm)`
+after its last dispatch. Supplying that callable as `judge_call_llm` to
+`wrap` or `run` does not transfer ownership to Goldfive.
 
 Both attach a `close` coroutine (via `_probe_close`, which duck-types
 `aclose`/`close` on the target and a nested `._client`/`.client`). Both

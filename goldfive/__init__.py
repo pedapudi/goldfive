@@ -5,10 +5,17 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from goldfive import builtin_judges
+from goldfive._llm import (
+    CallLLM,
+    ClosableCallLLM,
+    make_default_openai_call_llm,
+    maybe_close_call_llm,
+)
 from goldfive.adapters.callable import CallableAdapter
 from goldfive.config import (
     EmbeddingConfig,
     GoalDriftConfig,
+    JudgeConfig,
     ReasoningDriftConfig,
     RuntimeConfig,
     ToolLoopConfig,
@@ -78,7 +85,9 @@ __all__ = [
     "AckResult",
     "AgentAdapter",
     "BUILTIN_REPORTING_TOOLS",
+    "CallLLM",
     "CallableAdapter",
+    "ClosableCallLLM",
     "builtin_judges",
     "DRIFT_SELF_REPORTING_TOOLS",
     "DRIFT_SELF_REPORTING_TOOL_NAMES",
@@ -106,6 +115,7 @@ __all__ = [
     "InvocationResult",
     "JSONLPersistenceSink",
     "Judge",
+    "JudgeConfig",
     "JudgeContext",
     "JudgeVerdict",
     "LLMGoalDeriver",
@@ -135,6 +145,8 @@ __all__ = [
     "classify_refusal",
     "classify_stop_reason",
     "classify_tool_error",
+    "make_default_openai_call_llm",
+    "maybe_close_call_llm",
     "quickstart",
     "run",
     "steering_is_active",

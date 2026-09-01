@@ -62,7 +62,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:
     from goldfive.config import JudgeConfig
@@ -379,20 +379,23 @@ class ClosableCallLLM(CallLLM, Protocol):
     """Optional extension: a ``call_llm`` that owns network resources.
 
     Implementations should define an async ``close()`` that releases the
-    underlying HTTP session (e.g. ``await openai_client.close()``).
-    Goldfive's :class:`Runner.close` will await it automatically.
+    underlying HTTP session (e.g. ``await openai_client.close()``). A caller
+    that constructs or supplies the callable retains ownership unless the
+    accepting API explicitly documents otherwise.
     """
 
     async def close(self) -> None: ...
 
 
 async def maybe_close_call_llm(call_llm: Any, *, label: str = "call_llm") -> None:
-    """Await ``call_llm.close()`` if it exists. Swallow exceptions.
+    """Release resources owned by ``call_llm`` when it exposes ``close()``.
 
     Returns immediately when ``call_llm`` is ``None`` or has no
     ``close`` attribute. Logs and discards any exception raised by
-    ``close`` — Runner teardown must remain robust under partial
-    initialisation.
+    ``close`` so cleanup remains robust under partial initialisation.
+    Callers that create a callable with
+    :func:`make_default_openai_call_llm` should await this helper once
+    after the last dispatch.
     """
     if call_llm is None:
         return
@@ -540,17 +543,20 @@ def make_default_adk_call_llm(model: Any) -> CallLLM | None:
         await _probe_close(llm, label="adk_call_llm")
 
     _call_llm.close = _close  # type: ignore[attr-defined]
-    return _call_llm
+    return cast(CallLLM, _call_llm)
 
 
-def make_default_openai_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
+def make_default_openai_call_llm(
+    config: JudgeConfig,
+) -> tuple[ClosableCallLLM, str] | None:
     """Construct an OpenAI-compatible ``CallLLM`` from a :class:`JudgeConfig`.
 
     Returns ``(call_llm, model)`` or ``None`` when the ``openai``
-    package is not importable / the client cannot be built. Shape
-    mirrors :func:`make_default_adk_call_llm`: the returned callable
-    exposes a ``close`` coroutine so :class:`Runner` can tear down its
-    HTTP session on shutdown.
+    package is not importable or the client cannot be built. The returned
+    callable exposes a ``close`` coroutine. Ownership transfers to the
+    caller, which should await :func:`maybe_close_call_llm` once after its
+    last dispatch. Passing the callable to ``goldfive.wrap`` as
+    ``judge_call_llm`` does not transfer ownership to the resulting Runner.
 
     Design parallels :class:`goldfive.drift._embed._OpenAIEmbeddingBackend`
     — we intentionally tolerate missing / placeholder ``api_key`` so
@@ -664,7 +670,7 @@ def make_default_openai_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | N
         await _probe_close(client, label="openai_call_llm")
 
     _call_llm.close = _close  # type: ignore[attr-defined]
-    return _call_llm, model_name
+    return cast(ClosableCallLLM, _call_llm), model_name
 
 
 __all__ = [
