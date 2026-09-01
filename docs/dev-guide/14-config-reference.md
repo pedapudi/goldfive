@@ -100,7 +100,7 @@ Tracing `resolved_runtime` through `goldfive/convenience.py` `wrap()`, each of t
 | `reasoning_drift` | `goldfive.drift.reasoning` + `DefaultSteerer` | `_reasoning_module.configure(...)` AND steerer kwargs `reasoning_drift_config=` / `reasoning_drift_mode=` | process-wide detectors + per-Runner steerer |
 | `tool_loops` | `goldfive.drift.tool_loops` + `DefaultSteerer` | `_tool_loops_module.configure(...)` AND steerer kwarg `tool_loop_config=` | process-wide + per-Runner |
 | `goal_drift` | `DefaultSteerer` | steerer kwarg `goal_drift_config=` | per-Runner |
-| `judge` | judge routing in `wrap()` | `resolved_runtime.judge.base_url` selects the judge endpoint (tier 2 of judge precedence) | per-Runner |
+| `judge` | judge routing in `wrap()` | `resolved_runtime.judge.base_url` selects the judge endpoint when neither explicit callable route is present | per-Runner |
 | `steering` | `ContextEditor` build + `DefaultSteerer` | `build_editor_from_config(...context_editor_rules...)` AND steerer kwarg `steering_config=` | per-Runner |
 | `agent` | ADK adapter | `auto_adapter(..., llm_call_timeout_ms=resolved_runtime.agent.call_timeout_ms, agent_max_output_tokens=resolved_runtime.agent.max_output_tokens)` | per-Runner (ADK only) |
 
@@ -119,7 +119,11 @@ A subtlety: `RuntimeConfig()` and `RuntimeConfig.from_env()` differ ONLY when a 
 
 ### Precedence, in one sentence
 
-For every knob: **explicit kwarg > explicit `RuntimeConfig`/config-object field > `GOLDFIVE_*` env var > built-in default** — with the documented exceptions listed per family below (the most important: `Runner`'s two `bool | None` fail-fast kwargs where the env is only consulted when the kwarg is `None`, and `judge`/`call_llm` routing which has its own three-tier order).
+Most knobs use **explicit kwarg > explicit `RuntimeConfig` or
+config-object field > `GOLDFIVE_*` env var > built-in default**. The
+documented exceptions include `Runner`'s two `bool | None` fail-fast
+kwargs, where the env is consulted only when the kwarg is `None`.
+Judge-callable routing also has its own precedence order.
 
 ### Master environment-variable index
 
@@ -361,7 +365,11 @@ Takeaway: to go from "watching" to "acting" you flip `observation_only` to `Fals
 | `max_concurrent_judges` | `int` | `3` | `GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES` | `_read_int_env` |
 | `fallback_to_content_when_no_reasoning` | `bool` | `False` | `GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT` | `_read_bool_env` |
 
-**`mode`** — `"judge"` (LLM-as-a-judge only, the default), `"embedding"` (deterministic embedding detectors only), `"both"`, or `"off"`. Note: `DEFAULT_REASONING_DRIFT_MODE = "judge"` in `reasoning.py`. When `mode in ("judge", "both")` but no `call_llm` is wired, `wrap()` logs a loud WARNING that LLM-as-a-judge detection is disabled for the Runner (the silent-disarm guard).
+**`mode`** — `"judge"` (LLM-as-a-judge only, the default), `"embedding"`
+(deterministic embedding detectors only), `"both"`, or `"off"`.
+`DEFAULT_REASONING_DRIFT_MODE = "judge"` in `reasoning.py`. When
+`mode in ("judge", "both")` but no judge callable is wired, `wrap()`
+logs a WARNING that LLM-as-a-judge detection is disabled for the Runner.
 
 **`off_topic_distance_threshold`** — cosine-distance above which a reasoning block is flagged `OFF_TOPIC`. Consumed via `reasoning._off_topic_distance_threshold()`.
 
@@ -467,11 +475,20 @@ The circuit breaker (`_embed.py`) protects against a flapping HTTP backend: afte
 
 **Judge-routing precedence** (from `wrap()`, for the two drift judges' `call_llm` / `model`):
 
-1. Explicit `goldfive.wrap(call_llm=...)` — wins outright.
-2. `JudgeConfig.base_url` (i.e. `GOLDFIVE_JUDGE_BASE_URL`) — dedicated judge endpoint.
-3. Auto-detected tree LLM (`detect_llm`).
+1. Explicit `goldfive.wrap(judge_call_llm=...)` — dedicated caller-owned route.
+2. Explicit `goldfive.wrap(call_llm=...)` — shared route.
+3. `JudgeConfig.base_url` (i.e. `GOLDFIVE_JUDGE_BASE_URL`) — dedicated judge endpoint.
+4. Auto-detected tree LLM (`detect_llm`).
 
-If `JudgeConfig.base_url` is set but a `CallLLM` cannot be built (openai SDK missing / client rejects config), `wrap()` logs a WARNING and the judges fall back to the tree LLM. When the judges inherit the tree LLM via auto-detect (no explicit `call_llm=`, no `JudgeConfig`), `wrap()` emits the **named-model WARNING** naming the agent + model now handling judge traffic (and the concurrent-call count from `max_concurrent_judges`, and `REASONING_JUDGE_MAX_OUTPUT_TOKENS`) and telling the operator to set `GOLDFIVE_JUDGE_BASE_URL` / `GOLDFIVE_JUDGE_MODEL`. Judges routed through a dedicated endpoint register a `close` hook on the Runner so the HTTP client is torn down on `runner.close()`.
+An explicit `judge_model=` overrides the model name associated with any
+callable route. If `JudgeConfig.base_url` is set but a `CallLLM` cannot be
+built, `wrap()` logs a WARNING and the judges fall back to the tree LLM.
+When the judges inherit the tree LLM via auto-detect, `wrap()` emits the
+**named-model WARNING** naming the agent and model that handle judge
+traffic. The warning also reports the concurrent-call count and
+`REASONING_JUDGE_MAX_OUTPUT_TOKENS`. A `JudgeConfig`-created endpoint
+registers a `close` hook on the Runner. An explicit `judge_call_llm`
+remains caller-owned and receives no judge close hook.
 
 > **Cost model — why a separate judge endpoint matters.** Under the default auto-detect, up to `max_concurrent_judges` (3) background reasoning-judge calls run concurrently, EACH budgeting `REASONING_JUDGE_MAX_OUTPUT_TOKENS` (16384) output tokens, ON THE SAME endpoint the agent tree bills against. On a rate-limited cloud model that competes with the agent's own turns for capacity. `JudgeConfig` moves that traffic to a cheap local model. The two judges affected are the trajectory-level GOAL_DRIFT judge (#218) and the per-thinking-message reasoning judge (#226); the planner and goal_deriver stay on the tree LLM regardless.
 
@@ -483,7 +500,10 @@ If `JudgeConfig.base_url` is set but a `CallLLM` cannot be built (openai SDK mis
 
 ## 10. `wrap()` kwargs (`goldfive/convenience.py`)
 
-`wrap(agent, *, ...)` is the primary user entrypoint. Every component is overridable. `run(agent, user_input, *, context=None, **wrap_kwargs)` forwards everything except `context` to `wrap()`.
+`wrap(agent, *, ...)` is the primary user entrypoint. Every component is
+overridable. `run(agent, user_input, *, context=None,
+judge_call_llm=None, judge_model=None, **wrap_kwargs)` forwards its judge
+arguments and all remaining keywords to `wrap()`.
 
 | Kwarg | Type | Default | Effect |
 |---|---|---|---|
@@ -494,8 +514,10 @@ If `JudgeConfig.base_url` is set but a `CallLLM` cannot be built (openai SDK mis
 | `steerer` | `Steerer \| None` | `None` | Wins over `DefaultSteerer`. **An explicit steerer means `wrap()` does NOT thread the runtime sub-configs into it — you own its construction.** |
 | `sinks` | `list[EventSink] \| None` | `None` → `[LoggingSink()]` | Explicit `[]` suppresses all sinks. |
 | `control` | `ControlChannel \| None` | `None` | Live pause/resume/cancel/steer/rewind channel forwarded to the Runner. |
-| `call_llm` | `CallLLM \| None` | `None` | Async `(system, user, model) -> str`. Used for BOTH default planner and goal_deriver, AND is tier-1 in judge routing. Overrides any detected tree LLM. |
+| `call_llm` | `CallLLM \| None` | `None` | Async `(system, user, model) -> str`. Used for the default planner and goal deriver. It is the shared route for built-in drift judges when `judge_call_llm` is absent. Overrides any detected tree LLM. |
 | `model` | `str \| None` | `None` | Model name for `LLMPlanner` / `LLMGoalDeriver`. Ignored when no LLM. |
+| `judge_call_llm` | `CallLLM \| None` | `None` | Dedicated caller-owned callable for the default goal-drift and reasoning-drift judges. It outranks `call_llm`, `RuntimeConfig.judge`, and the detected tree LLM. Goldfive does not register a judge close hook for it. |
+| `judge_model` | `str \| None` | `None` | Model name passed only to the default goal-drift and reasoning-drift judges. It outranks the model associated with every fallback judge route. |
 | `max_task_invocations` | `int \| None` | `None` (unbounded) | Cap on total adapter invocations per run. Flowed into both the `SequentialExecutor` default AND the `Runner`. Accepts deprecated `max_plan_reinvocations` for one release (DeprecationWarning). |
 | `plugins` | `list[Any] \| None` | `None` | ADK `BasePlugin`s installed on every per-agent runner (so `AgentTool` / `sub_agents` dispatches see the same plugins as the coordinator). Ignored for non-ADK. goldfive#121. |
 | `runtime` | `RuntimeConfig \| None` | `None` → `RuntimeConfig.from_env()` | The typed-config aggregate. See §1. |
@@ -525,7 +547,9 @@ When `agent` is an ADK `BaseAgent`, `wrap()` returns a `GoldfiveADKAgent` (a `Ba
 | Combination | What actually happens |
 |---|---|
 | `steerer=` + `runtime=` | The `runtime` sub-configs (`steering`, `goal_drift`, `tool_loops`, `reasoning_drift`) are NOT threaded into your steerer — `wrap()` only configures the DEFAULT steerer it builds. But `runtime.embedding` / `.reasoning_drift` / `.tool_loops` ARE still `configure()`d process-wide (that happens before the steerer branch). So detector thresholds apply; steerer policy does not. Construct your steerer with the configs you want. |
-| `call_llm=` + `runtime=RuntimeConfig(judge=JudgeConfig(base_url=...))` | `call_llm=` wins for the judges (tier 1). `JudgeConfig.base_url` is IGNORED because the explicit callable outranks it. If you want judges on a separate endpoint, do NOT also pass `call_llm=`. |
+| `judge_call_llm=` + `call_llm=` | The default planner and goal deriver use `call_llm`. The built-in goal-drift and reasoning-drift judges use `judge_call_llm`. |
+| `judge_call_llm=` + `runtime=RuntimeConfig(judge=JudgeConfig(base_url=...))` | The explicit judge callable wins, so Goldfive does not construct a client from `JudgeConfig` and does not register a close hook for the caller-owned callable. |
+| `call_llm=` + `runtime=RuntimeConfig(judge=JudgeConfig(base_url=...))` | `call_llm=` wins for the judges when `judge_call_llm` is absent. `JudgeConfig.base_url` is ignored. |
 | `judges=[...]` + `disable_judges=[...]` | `TypeError`. They are mutually exclusive — an explicit `judges=` already spells out the exact set. |
 | `judges=[]` (empty) | Opts out of the `JudgementEmitted` envelope surface. The legacy hardcoded detector path STILL runs and still fires `DriftDetected`; you just lose the new judge-envelope events. |
 | `planner=` + `judge_only=True` | Your explicit `planner=` wins; `judge_only` only supplies DEFAULTS for `planner`/`goal_deriver`. Same for explicit `goal_deriver=` / `steerer=`. |
@@ -536,11 +560,23 @@ When `agent` is an ADK `BaseAgent`, `wrap()` returns a `GoldfiveADKAgent` (a `Ba
 
 ### The named-model WARNING you will see (and how to silence it)
 
-When you `wrap(tree)` with no `call_llm=` and no `JudgeConfig`, the judges inherit the auto-detected tree LLM and `wrap()` logs a WARNING naming the agent + model now handling judge traffic, the concurrent-call count (`max_concurrent_judges`), and the judge output-token ceiling (`REASONING_JUDGE_MAX_OUTPUT_TOKENS`). This is intentional — billed/rate-limited cloud endpoints should be visible from logs. Silence it deliberately by passing `call_llm=` OR setting `GOLDFIVE_JUDGE_BASE_URL` / `GOLDFIVE_JUDGE_MODEL`. Do NOT suppress the log line itself.
+When `wrap(tree)` receives no `judge_call_llm=`, no `call_llm=`, and no
+`JudgeConfig`, the judges inherit the auto-detected tree LLM. `wrap()`
+logs a WARNING that names the agent, model, concurrent-call count, and
+`REASONING_JUDGE_MAX_OUTPUT_TOKENS`. The warning makes use of a billed or
+rate-limited cloud endpoint visible. Select a judge route by passing
+`judge_call_llm=`, passing `call_llm=`, or setting
+`GOLDFIVE_JUDGE_BASE_URL` / `GOLDFIVE_JUDGE_MODEL`.
 
 ### The silent-disarm WARNING (judges wired but no callable)
 
-If `reasoning_drift_mode in ("judge", "both")` but no `call_llm` resolved (no explicit, no `JudgeConfig`, and `detect_llm` found nothing on the tree), `wrap()` logs a loud WARNING that LLM-as-a-judge detection is DISABLED for the Runner. The detectors are "on" in config but inert. The usual cause: forgetting `call_llm=` on a non-ADK agent, or an ADK agent `detect_llm` cannot introspect. See goldfive#218/#226 history.
+If `reasoning_drift_mode in ("judge", "both")` but no judge callable
+resolved, `wrap()` logs a WARNING that LLM-as-a-judge detection is
+disabled for the Runner. A judge callable is absent when the caller
+provides no dedicated or shared callable, `JudgeConfig` is not set, and
+`detect_llm` finds nothing on the tree. The usual cause is a non-ADK
+agent without `judge_call_llm=` or `call_llm=`, or an ADK agent that
+`detect_llm` cannot introspect. See goldfive#218/#226 history.
 
 ---
 
@@ -670,7 +706,7 @@ Mostly constructed by `wrap()` from the runtime sub-configs, but the constructor
 | `reflective_call_llm` | `ReflectiveCallLLM \| None` | `None` | LLM for the reflective check. |
 | `reflective_model` | `str` | `""` | Model for the reflective check. |
 | `goal_drift_check_interval` | `int \| None` | `None` | Legacy override; superseded by `goal_drift_config.check_interval` when a config is passed. |
-| `goal_drift_call_llm` | `ReflectiveCallLLM \| None` | `None` | The GOAL_DRIFT judge callable (wired by `wrap()` from `judge_call_llm`). |
+| `goal_drift_call_llm` | `ReflectiveCallLLM \| None` | `None` | The GOAL_DRIFT judge callable. `wrap()` supplies the callable from its resolved judge route. |
 | `goal_drift_model` | `str` | `""` | GOAL_DRIFT judge model. |
 | `goal_drift_activity_window` | `int \| None` | `None` | Legacy override; superseded by `goal_drift_config.activity_window`. |
 | `goal_drift_config` | `GoalDriftConfig \| None` | `None` | Typed config (preferred). |
@@ -994,7 +1030,7 @@ The general rule is **explicit kwarg > config-object field > env var > built-in 
 | `embedding` / `reasoning_drift` / `tool_loops` | `configure()` (process-global) | Installed by `wrap()`. Last `wrap()` in the process wins. `configure(None)` clears → detectors fall back to module constants. |
 | `_embed.py` direct env reads | lazy `_try_load_openai_backend` | Only used when no `configure()` ran; same env names, so identical surface. |
 | `agent` / `steering` / `goal_drift` / `judge` | Threaded per-Runner into adapter / steerer | Per-Runner; no process-global state. |
-| `call_llm` / judge routing | `wrap()` | `call_llm=` kwarg > `JudgeConfig.base_url` > detected tree LLM (judges only; planner/goal_deriver stay on `call_llm`/detected). |
+| LLM and judge routing | `wrap()` | Built-in judges use `judge_call_llm=` > `call_llm=` > `JudgeConfig.base_url` > detected tree LLM. `judge_model=` overrides the judge model name. The planner and goal deriver stay on `call_llm` or the detected tree LLM. |
 | `fail_fast_on_revision_rejection` | `Runner.__init__` | kwarg `True`/`False` > env `GOLDFIVE_FAIL_FAST_REVISION_REJECTION` (only when kwarg is `None`) > default `False`. |
 | `fail_fast_on_invoke_cancel` | `SequentialExecutor.__init__` | kwarg `True`/`False` > env `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL` (only when kwarg is `None`) > default `False`. |
 | `report_awaiting_approval` timeout | handler | explicit positive `timeout_ms` arg > `SteeringConfig.approval_default_timeout_ms` > `DEFAULT_APPROVAL_TIMEOUT_MS` (when config value non-positive). |
@@ -1173,6 +1209,22 @@ runner = goldfive.wrap(tree, runtime=RuntimeConfig(
 ))
 ```
 This suppresses the named-model WARNING (you made a deliberate choice) and registers a Runner close-hook so the judge HTTP client tears down on `runner.close()`.
+
+Callers that already manage a judge client can inject its callable
+directly. The planner and goal deriver continue to use `agent_call_llm`:
+
+```python
+runner = goldfive.wrap(
+    tree,
+    call_llm=agent_call_llm,
+    model="agent-model",
+    judge_call_llm=judge_call_llm,
+    judge_model="judge-model",
+)
+```
+
+Goldfive does not register a judge close hook for `judge_call_llm` in
+this form. The code that created the callable must close its client.
 
 ### Turn OFF the reasoning judge, keep deterministic detectors only
 

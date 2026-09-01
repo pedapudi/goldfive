@@ -1143,23 +1143,28 @@ surface that cancels in-flight work. Detection runs, intervention is gated.
 ### 10.2 Endpoint-contention warning (#483)
 
 At `goldfive.wrap` time, when the judges' callable was **inherited** from
-`detect_llm` — i.e. the operator passed neither `call_llm=` nor a
-`JudgeConfig` — `goldfive/convenience.py` logs a WARNING naming the cost
-explicitly: judge traffic (up to `max_concurrent_judges` in flight, each
-with `REASONING_JUDGE_MAX_OUTPUT_TOKENS` output tokens) lands on the
+`detect_llm` — i.e. the operator passed no `judge_call_llm=`, no
+`call_llm=`, and no `JudgeConfig` — `goldfive/convenience.py` logs a
+WARNING naming the cost explicitly. Judge traffic includes up to
+`max_concurrent_judges` calls in flight. Each call has a
+`REASONING_JUDGE_MAX_OUTPUT_TOKENS` budget and lands on the
 **same** endpoint the agent tree bills against, competing for
 capacity/rate-limits. It points to `GOLDFIVE_JUDGE_BASE_URL` /
 `GOLDFIVE_JUDGE_MODEL` (i.e. a `JudgeConfig`) to route judges to a
-dedicated endpoint. An explicit `call_llm=` or `JudgeConfig` suppresses the
-warning (the operator already made a deliberate choice). The warning
+dedicated endpoint. An explicit `judge_call_llm=`, `call_llm=`, or
+`JudgeConfig` suppresses the warning because the operator selected a
+route. The warning
 prefers the agent's own `.name` over the Python class name so it names
 *which* agent the LLM was detected from.
 
 `JudgeConfig` (in `config.py`) is exactly this dedicated-endpoint escape
 hatch: when `base_url` is set, `goldfive.wrap` routes the two judges (and
 only the judges — planner/goal_deriver keep the tree LLM) through
-`make_default_openai_call_llm(config)`. Precedence: explicit `call_llm=`
-kwarg > `JudgeConfig.base_url` > auto-detected tree LLM.
+`make_default_openai_call_llm(config)`. Precedence: explicit
+`judge_call_llm=` > explicit `call_llm=` > `JudgeConfig.base_url` >
+auto-detected tree LLM. `judge_model=` overrides the model name passed
+through the selected callable. Goldfive registers a close hook only for
+the client it constructs from `JudgeConfig`.
 
 ---
 

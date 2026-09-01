@@ -87,6 +87,8 @@ def wrap(
     control: ControlChannel | None = None,
     call_llm: Callable[[str, str, str], Awaitable[str]] | None = None,
     model: str | None = None,
+    judge_call_llm: Callable[[str, str, str], Awaitable[str]] | None = None,
+    judge_model: str | None = None,
     max_task_invocations: int | None = None,
     plugins: list[Any] | None = None,
     runtime: RuntimeConfig | None = None,
@@ -104,9 +106,18 @@ async def run(
     user_input: str | list[Goal],
     *,
     context: Mapping[str, Any] | None = None,
+    judge_call_llm: Callable[[str, str, str], Awaitable[str]] | None = None,
+    judge_model: str | None = None,
     **wrap_kwargs: Any,
 ) -> ExecutionOutcome: ...
 ```
+
+`judge_call_llm` supplies a dedicated callable for the default
+goal-drift and reasoning-drift judges. It takes precedence over the
+shared `call_llm` route and `RuntimeConfig.judge`. `judge_model` changes
+the model name passed to those judges without changing the planner or
+goal deriver. Goldfive does not register a judge close hook for a
+caller-supplied callable; the caller retains ownership of its resources.
 
 `agent` can be any of:
 

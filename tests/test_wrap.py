@@ -155,6 +155,57 @@ async def test_run_convenience_returns_outcome() -> None:
     assert isinstance(outcome, ExecutionOutcome)
 
 
+async def test_run_forwards_only_explicit_dedicated_judge_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run()`` forwards the judge route without changing omitted kwargs."""
+    from goldfive import convenience
+
+    forwarded: dict[str, Any] = {}
+    expected_outcome = object()
+
+    async def judge_call_llm(system: str, user: str, model: str) -> str:
+        return f"{system}:{user}:{model}"
+
+    class _Runner:
+        async def run(self, user_input: str, *, context: Any = None) -> Any:
+            forwarded["user_input"] = user_input
+            forwarded["context"] = context
+            return expected_outcome
+
+    def _wrap(agent: Any, **kwargs: Any) -> _Runner:
+        forwarded["agent"] = agent
+        forwarded.update(kwargs)
+        return _Runner()
+
+    monkeypatch.setattr(convenience, "wrap", _wrap)
+
+    outcome = await goldfive.run(
+        _happy_agent,
+        "do the thing",
+        context={"request_id": "request-1"},
+        judge_call_llm=judge_call_llm,
+        judge_model="judge-model",
+        sinks=[],
+    )
+
+    assert outcome is expected_outcome
+    assert forwarded == {
+        "agent": _happy_agent,
+        "judge_call_llm": judge_call_llm,
+        "judge_model": "judge-model",
+        "sinks": [],
+        "user_input": "do the thing",
+        "context": {"request_id": "request-1"},
+    }
+
+    forwarded.clear()
+    await goldfive.run(_happy_agent, "do the thing", sinks=[])
+
+    assert "judge_call_llm" not in forwarded
+    assert "judge_model" not in forwarded
+
+
 # ---------------------------------------------------------------------------
 # Overrides
 # ---------------------------------------------------------------------------

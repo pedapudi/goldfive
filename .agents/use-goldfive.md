@@ -49,6 +49,24 @@ planner + goal-deriver; and defaults the executor to
 `SequentialExecutor(overlay_mode=True)` for ADK wrap targets
 (goldfive#141).
 
+To keep planning on the agent's LLM while routing Goldfive's built-in
+goal-drift and reasoning-drift judges through a separate client, pass a
+dedicated caller-owned callable:
+
+```python
+runner = goldfive.wrap(
+    my_agent,
+    call_llm=agent_call_llm,
+    model="agent-model",
+    judge_call_llm=judge_call_llm,
+    judge_model="judge-model",
+)
+```
+
+`judge_call_llm` takes precedence over the shared `call_llm` route and
+`RuntimeConfig.judge`. Goldfive does not register a judge close hook for
+a caller-supplied callable, so the caller must close its client.
+
 For the tightest possible Runner construction with an explicit
 `StaticPlanner`, `goldfive.quickstart` is still available:
 

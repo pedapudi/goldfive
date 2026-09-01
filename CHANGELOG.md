@@ -39,6 +39,14 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ### Convenience
 
+- **Dedicated callable routing for built-in drift judges.**
+  `goldfive.wrap` and `goldfive.run` accept `judge_call_llm=` and
+  `judge_model=`. The dedicated callable takes precedence over the shared
+  `call_llm` route, `RuntimeConfig.judge`, and an auto-detected tree LLM.
+  The planner and goal deriver continue to use `call_llm` or the detected
+  tree LLM. Goldfive registers a close hook only when it constructs a
+  judge client from `RuntimeConfig.judge`; callers retain ownership of a
+  callable supplied through `judge_call_llm`.
 - **First-class judge-only mode: `goldfive.wrap(agent, judge_only=True)`
   (and `goldfive.run`, via `**wrap_kwargs`) — closes #445.** Runs the
   wrapped agent NATIVELY while keeping the drift judges armed, issuing
@@ -51,8 +59,9 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
   returns `None` and aborts empty) and `goal_deriver`
   (`LiteralGoalDeriver`, no goal-derive call); an explicit `planner=` /
   `goal_deriver=` / `steerer=` still wins. The judges are untouched —
-  still wired off `call_llm` / the detected tree LLM / `JudgeConfig`
-  exactly as in full mode. Note `SteeringConfig.observation_only` does
+  still use the full-mode routing from `judge_call_llm`, `call_llm`, the
+  detected tree LLM, or `JudgeConfig`. Note that
+  `SteeringConfig.observation_only` does
   NOT achieve this: it gates only the three drift-reactive injection
   points while the planner's goal-derivation / per-turn planning /
   refine still run and burn LLM calls.

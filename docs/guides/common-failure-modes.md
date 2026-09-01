@@ -200,9 +200,10 @@ looks at the recent activity window and decides whether the tree is
 advancing `session.goals` (goldfive#143). Emits `GOAL_DRIFT` /
 CRITICAL when the judge concludes progress has stalled.
 
-**Feature gate.** On the `goldfive.wrap(...)` path the judge is wired
-automatically from the resolved planner `call_llm` (goldfive#217);
-opt out with an explicit steerer
+**Feature gate.** On the `goldfive.wrap(...)` path the judge resolves
+from `judge_call_llm=`, `call_llm=`, `RuntimeConfig.judge`, or the
+agent tree, in that precedence order. The planner and goal deriver do
+not use `judge_call_llm`. Opt out with an explicit steerer
 (`DefaultSteerer(goal_drift_call_llm=None)`) or
 `Runner(goal_drift_enabled=False)`. Operators hand-building a Runner
 with a bare `DefaultSteerer()` never trigger it and pay no LLM cost.

@@ -187,6 +187,8 @@ both `wrap` and `run`:
 | `sinks=` | `[LoggingSink()]` | Pass `[]` to suppress |
 | `call_llm=` | auto-detected from ADK trees; none otherwise | Async `(system, user, model) -> str` |
 | `model=` | auto-detected from ADK; else empty string | |
+| `judge_call_llm=` | shared `call_llm`, `RuntimeConfig.judge`, or detected tree LLM | Dedicated async callable for the built-in goal-drift and reasoning-drift judges; the caller owns its lifetime |
+| `judge_model=` | model resolved for the selected judge callable | Model name passed only to the built-in drift judges |
 | `max_task_invocations=` | `None` (unbounded) | Cap on adapter invocations per run |
 | `plugins=` | `None` | List of ADK `BasePlugin` instances installed on the runner |
 | `control=` | `None` | `ControlChannel` for live PAUSE / STEER / CANCEL / etc. |
