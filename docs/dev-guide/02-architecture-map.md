@@ -243,18 +243,21 @@ usable `(call_llm, model_name)` pair. It runs **whenever the caller did not pass
 which caused a silent-disarm bug (judges inert when the caller supplied their own
 planner + goal_deriver). Do not re-add that guard.
 
-The judges' callable is resolved by a strict precedence (`convenience.py` around
-the "Judge routing" comment):
+The two built-in drift judges resolve their callable through a strict
+precedence (`convenience.py` around the "Judge routing" comment):
 
-1. Explicit `wrap(call_llm=...)` — wins outright.
-2. `resolved_runtime.judge.base_url` (dedicated judge endpoint) via
+1. Explicit `wrap(judge_call_llm=...)` — dedicated caller-owned route.
+2. Explicit `wrap(call_llm=...)` — shared route.
+3. `resolved_runtime.judge.base_url` (dedicated judge endpoint) via
    `_build_judge_call_llm` → `make_default_openai_call_llm` (`goldfive/_llm.py`,
    the one LLM-call module after #491).
-3. Auto-detected tree LLM (`detect_llm`).
+4. Auto-detected tree LLM (`detect_llm`).
 
 The **planner + goal_deriver** always stay on `resolved_call_llm`; only the two
-drift judges may route to `JudgeConfig`. When the judges inherit the tree LLM
-(case 3), `wrap` logs a **named-model WARNING** naming the model and the concurrent
+drift judges use `judge_call_llm`, `judge_model`, or `JudgeConfig`. Goldfive adds
+a close hook for a callable it constructs from `JudgeConfig`. The caller remains
+responsible for closing an explicit `judge_call_llm`. When the judges inherit the
+tree LLM, `wrap` logs a **named-model WARNING** naming the model and the concurrent
 judge-call cost so a billed cloud endpoint is visible in logs.
 
 ### 1.5 Planner, goal-deriver, executor, steerer

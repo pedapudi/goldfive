@@ -729,7 +729,18 @@ assert ledger["emitted_late"] == 1
 assert ledger["acted_on"] == 0
 ```
 
-The teardown summary event is emitted by `shutdown()` — after `await steerer.drift.shutdown()` (or the runner close path) assert `steerer.drift._verdict_ledgers == {}` (flushed and cleared). A redundant verdict at the `handle_drift` gates increments `emitted_redundant`; a parse failure increments `parse_fail`. The `wrap()`-time endpoint-contention warning is a separate assertion: `test_wrap_warning_names_shared_endpoint_cost` asserts exactly one shared-endpoint WARNING log record fires when the judge and agent share an endpoint, and `test_wrap_warning_suppressed_when_call_llm_explicit` asserts it is suppressed when the operator supplied `call_llm=` explicitly. (This is one of the few sanctioned `caplog` assertions — the warning IS the contract.)
+The teardown summary event is emitted by `shutdown()`. After
+`await steerer.drift.shutdown()` or the runner close path, assert
+`steerer.drift._verdict_ledgers == {}`. A redundant verdict at the
+`handle_drift` gates increments `emitted_redundant`; a parse failure
+increments `parse_fail`.
+
+The `wrap()`-time endpoint-contention warning has separate assertions.
+`test_wrap_warning_names_shared_endpoint_cost` asserts that one WARNING
+fires when the judge and agent share an endpoint. The warning-suppression
+tests cover explicit `judge_call_llm=`, `call_llm=`, and `JudgeConfig`
+routes. These sanctioned `caplog` assertions protect the warning
+contract.
 
 ---
 

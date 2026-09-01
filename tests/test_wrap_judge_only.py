@@ -163,6 +163,32 @@ def test_judge_only_false_is_byte_identical_full_planning() -> None:
     assert isinstance(runner.goal_deriver, LLMGoalDeriver)
 
 
+def test_judge_only_accepts_dedicated_judge_route_without_planning_calls() -> None:
+    """Dedicated judge routing does not change judge-only planner defaults."""
+    planner_llm = _spy_call_llm([])
+    judge_llm = _spy_call_llm([])
+    runner = goldfive.wrap(
+        _happy_agent,
+        judge_only=True,
+        call_llm=planner_llm,
+        model="planner-model",
+        judge_call_llm=judge_llm,
+        judge_model="judge-model",
+        sinks=[],
+    )
+
+    assert isinstance(runner.planner, StaticPlanner)
+    assert isinstance(runner.goal_deriver, LiteralGoalDeriver)
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goal_drift_call_llm is judge_llm
+    assert steerer._reasoning_drift_call_llm is judge_llm
+    assert steerer._goal_drift_model == "judge-model"
+    assert steerer._reasoning_drift_model == "judge-model"
+    assert planner_llm.calls == []  # type: ignore[attr-defined]
+    assert judge_llm.calls == []  # type: ignore[attr-defined]
+
+
 # ---------------------------------------------------------------------------
 # 2. A judge_only run produces a NON-EMPTY transcript (no empty-abort trap)
 # ---------------------------------------------------------------------------

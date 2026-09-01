@@ -341,6 +341,60 @@ def test_wrap_explicit_call_llm_wins_over_judge_config() -> None:
     assert steerer._goal_drift_model == "explicit-model"
 
 
+def test_wrap_explicit_judge_call_llm_wins_over_shared_and_config_routes() -> None:
+    """The dedicated callable wins without changing planner LLM routing."""
+    shared = _StubCallable("shared")
+    dedicated = _StubCallable("dedicated")
+
+    def _must_not_build(_cfg: Any) -> Any:
+        raise AssertionError("JudgeConfig path should be suppressed")
+
+    runtime = RuntimeConfig(
+        judge=JudgeConfig(base_url="http://should-not-build:9000", model="config-model"),
+    )
+    runner = goldfive.wrap(
+        _noop_agent,
+        call_llm=shared,
+        model="planner-model",
+        judge_call_llm=dedicated,
+        judge_model="judge-model",
+        runtime=runtime,
+        sinks=[],
+        judge_call_llm_builder=_must_not_build,
+    )
+
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goal_drift_call_llm is dedicated
+    assert steerer._reasoning_drift_call_llm is dedicated
+    assert steerer._goal_drift_model == "judge-model"
+    assert steerer._reasoning_drift_model == "judge-model"
+    assert runner.planner._call_llm is shared
+    assert runner.planner._model == "planner-model"
+    assert runner.goal_deriver._call_llm is shared
+    assert runner.goal_deriver._model == "planner-model"
+
+
+def test_wrap_omitted_judge_arguments_preserve_shared_llm_route() -> None:
+    """Omitted judge arguments preserve the shared planner-and-judge route."""
+    shared = _StubCallable("shared")
+    runner = goldfive.wrap(
+        _noop_agent,
+        call_llm=shared,
+        model="shared-model",
+        sinks=[],
+    )
+
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goal_drift_call_llm is shared
+    assert steerer._reasoning_drift_call_llm is shared
+    assert steerer._goal_drift_model == "shared-model"
+    assert steerer._reasoning_drift_model == "shared-model"
+    assert runner.planner._call_llm is shared
+    assert runner.goal_deriver._call_llm is shared
+
+
 def test_wrap_falls_back_when_judge_config_build_fails() -> None:
     """A ``JudgeConfig`` build failure falls back to the detected LLM."""
     detected = _StubCallable("detected")
@@ -382,3 +436,50 @@ class _StubCallable:
 
     async def __call__(self, system: str, user: str, model: str) -> str:
         return f"{self._label}:{model}"
+
+
+class _ClosableStubCallable(_StubCallable):
+    """Call marker that records whether Goldfive closes it."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def test_wrap_does_not_own_explicit_judge_callable() -> None:
+    """Runner shutdown leaves a caller-supplied judge callable open."""
+    dedicated = _ClosableStubCallable("dedicated")
+    runner = goldfive.wrap(
+        _noop_agent,
+        judge_call_llm=dedicated,
+        judge_model="judge-model",
+        sinks=[],
+    )
+
+    await runner.close()
+
+    assert dedicated.close_calls == 0
+
+
+async def test_wrap_closes_judge_config_callable() -> None:
+    """Runner shutdown still closes a JudgeConfig-created callable."""
+    configured = _ClosableStubCallable("configured")
+
+    def _fake_build(_cfg: JudgeConfig) -> tuple[Any, str]:
+        return configured, "config-model"
+
+    runner = goldfive.wrap(
+        _noop_agent,
+        runtime=RuntimeConfig(
+            judge=JudgeConfig(base_url="http://judge:9000", model="config-model")
+        ),
+        sinks=[],
+        judge_call_llm_builder=_fake_build,
+    )
+
+    await runner.close()
+
+    assert configured.close_calls == 1

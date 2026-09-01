@@ -152,10 +152,12 @@ def test_wrap_wires_call_llm_into_reasoning_drift_judge() -> None:
 def test_wrap_does_not_arm_reasoning_judge_when_steerer_explicit() -> None:
     """An explicit ``steerer=`` wins: wrap() does not patch kwargs in."""
     call_llm = _stub_call_llm([])
+    judge_call_llm = _stub_call_llm([])
     explicit = DefaultSteerer(reasoning_drift_call_llm=None)
     runner = goldfive.wrap(
         _noop_agent,
         call_llm=call_llm,
+        judge_call_llm=judge_call_llm,
         steerer=explicit,
         sinks=[],
     )
@@ -396,6 +398,28 @@ def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
     with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(
             _noop_agent, call_llm=call_llm, sinks=[], llm_detector=detector
+        )
+
+    matching = [
+        r
+        for r in caplog.records
+        if "judge LLM not explicitly configured" in r.getMessage()
+    ]
+    assert matching == []
+
+
+def test_wrap_suppresses_named_model_warning_when_judge_call_llm_explicit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit judge callable makes the shared-endpoint warning irrelevant."""
+    _, detector = _make_detect_llm("planner-model")
+
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
+        goldfive.wrap(
+            _noop_agent,
+            judge_call_llm=_stub_call_llm([]),
+            sinks=[],
+            llm_detector=detector,
         )
 
     matching = [

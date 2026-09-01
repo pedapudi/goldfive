@@ -127,6 +127,8 @@ def wrap(
     control: ControlChannel | None = None,
     call_llm: CallLLM | None = None,
     model: str | None = None,
+    judge_call_llm: CallLLM | None = None,
+    judge_model: str | None = None,
     max_task_invocations: int | None = None,
     plugins: list[Any] | None = None,
     runtime: RuntimeConfig | None = None,
@@ -176,6 +178,18 @@ def wrap(
         Optional model name passed to :class:`LLMPlanner` /
         :class:`LLMGoalDeriver`. Ignored when ``call_llm`` is omitted
         and no LLM is detected on the agent.
+    judge_call_llm:
+        Optional async ``(system, user, model) -> str`` callable used
+        only by the default goal-drift and reasoning-drift judges. It
+        takes precedence over ``call_llm`` and ``runtime.judge``.
+        ``wrap()`` does not register a judge close hook for a
+        caller-supplied callable. An explicit ``steerer=`` retains full
+        control and is not modified.
+    judge_model:
+        Optional model name passed only to the default goal-drift and
+        reasoning-drift judges. When omitted, the judges use the model
+        resolved from ``model``, ``runtime.judge``, or the agent tree,
+        according to the callable source.
     max_task_invocations:
         Optional cap on total adapter invocations per run. Defaults to
         ``None`` (unbounded); flowed into both the
@@ -295,8 +309,9 @@ def wrap(
 
         It is a convenience that sets the defaults for ``planner`` and
         ``goal_deriver``; it does NOT touch the judges (they remain wired
-        from ``call_llm`` / the detected tree LLM / ``JudgeConfig`` exactly
-        as in full mode). Concretely, when the caller did not supply them:
+        through the same ``judge_call_llm`` / ``call_llm`` / detected
+        tree LLM / ``JudgeConfig`` resolution used in full mode).
+        Concretely, when the caller did not supply them:
 
         * ``planner`` defaults to a :class:`StaticPlanner` carrying a
           single framing task. Under the overlay executor that drives ONE
@@ -440,15 +455,18 @@ def wrap(
             if not resolved_model:
                 resolved_model = detected_model
 
-    # Judge routing (goldfive JudgeConfig + named-model WARNING).
+    # Judge routing (explicit judge override + JudgeConfig + named-model WARNING).
     # Precedence for the two drift judges' call_llm / model:
-    #   1. Explicit ``goldfive.wrap(call_llm=...)`` — wins outright.
-    #   2. ``resolved_runtime.judge.base_url`` — dedicated judge endpoint.
-    #   3. Auto-detected tree LLM (``detect_llm``).
+    #   1. Explicit ``goldfive.wrap(judge_call_llm=...)``.
+    #   2. Explicit ``goldfive.wrap(call_llm=...)`` (shared route).
+    #   3. ``resolved_runtime.judge.base_url`` — dedicated judge endpoint.
+    #   4. Auto-detected tree LLM (``detect_llm``).
     # The planner + goal_deriver stay on ``resolved_call_llm`` regardless;
-    # only the two judges get routed to JudgeConfig when it is set.
-    judge_call_llm: CallLLM | None = resolved_call_llm
-    judge_model: str = resolved_model
+    # only the two judges use the explicit judge route or JudgeConfig.
+    resolved_judge_call_llm: CallLLM | None = (
+        judge_call_llm if judge_call_llm is not None else resolved_call_llm
+    )
+    resolved_judge_model: str = judge_model if judge_model is not None else resolved_model
     judge_from_config: bool = False
     # Test seam: ``judge_call_llm_builder`` replaces
     # :func:`_build_judge_call_llm` for this call. Same pattern as
@@ -456,12 +474,12 @@ def wrap(
     judge_builder = (
         judge_call_llm_builder if judge_call_llm_builder is not None else _build_judge_call_llm
     )
-    if call_llm is None and resolved_runtime.judge.base_url:
+    if judge_call_llm is None and call_llm is None and resolved_runtime.judge.base_url:
         built = judge_builder(resolved_runtime.judge)
         if built is not None:
-            judge_call_llm, judge_config_model = built
-            if judge_config_model:
-                judge_model = judge_config_model
+            resolved_judge_call_llm, judge_config_model = built
+            if judge_model is None and judge_config_model:
+                resolved_judge_model = judge_config_model
             judge_from_config = True
         else:
             log.warning(
@@ -478,9 +496,9 @@ def wrap(
     # :class:`JudgeConfig` — surface which model is now handling judge
     # traffic so billed / rate-limited cloud endpoints are visible
     # from logs rather than hidden inside the adapter. An explicit
-    # ``call_llm=`` or an explicit ``JudgeConfig`` suppresses the
-    # warning (the operator has already made a deliberate choice).
-    if _call_llm_from_detect and not judge_from_config:
+    # ``judge_call_llm=``, ``call_llm=``, or an explicit ``JudgeConfig``
+    # suppresses the warning because the operator selected a route.
+    if _call_llm_from_detect and judge_call_llm is None and not judge_from_config:
         # Prefer the agent's own ``.name`` ("coordinator_agent", "research_agent",
         # ...) over the Python class name ("LlmAgent", "BaseAgent", ...) — the
         # latter is nearly useless for identifying *which* agent in a tree the
@@ -580,22 +598,22 @@ def wrap(
     resolved_steerer: Steerer
     if steerer is not None:
         resolved_steerer = steerer
-    elif judge_call_llm is not None:
+    elif resolved_judge_call_llm is not None:
         # The two drift judges share a single callable: the
         # trajectory-level GOAL_DRIFT judge (goldfive#218) and the
         # per-thinking-message reasoning judge (goldfive#226). Default
         # ``reasoning_drift_mode`` on the steerer is ``"judge"`` -- see
-        # :class:`DefaultSteerer`. ``judge_call_llm`` comes from the
-        # precedence chain above: explicit > JudgeConfig > detected.
+        # :class:`DefaultSteerer`. ``resolved_judge_call_llm`` comes from
+        # the precedence chain above.
         resolved_steerer = DefaultSteerer(
-            goal_drift_call_llm=judge_call_llm,
-            goal_drift_model=judge_model,
+            goal_drift_call_llm=resolved_judge_call_llm,
+            goal_drift_model=resolved_judge_model,
             goal_drift_config=resolved_runtime.goal_drift,
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
-            reasoning_drift_call_llm=judge_call_llm,
-            reasoning_drift_model=judge_model,
+            reasoning_drift_call_llm=resolved_judge_call_llm,
+            reasoning_drift_model=resolved_judge_model,
             steering_config=resolved_runtime.steering,
         )
     else:
@@ -673,8 +691,8 @@ def wrap(
     # down on ``runner.close()`` rather than leaking until process
     # exit. (Judges inheriting the tree LLM already close via the
     # planner/goal_deriver close path.)
-    if judge_from_config and judge_call_llm is not None:
-        _close = getattr(judge_call_llm, "close", None)
+    if judge_from_config and resolved_judge_call_llm is not None:
+        _close = getattr(resolved_judge_call_llm, "close", None)
         if callable(_close):
             runner.add_close_hook(_close)
 
@@ -692,19 +710,32 @@ async def run(
     user_input: str | list[Goal],
     *,
     context: Mapping[str, Any] | None = None,
+    judge_call_llm: CallLLM | None = None,
+    judge_model: str | None = None,
     **wrap_kwargs: Any,
 ) -> ExecutionOutcome:
     """Wrap ``agent`` and run it against ``user_input`` in one call.
 
     Equivalent to::
 
-        runner = goldfive.wrap(agent, **wrap_kwargs)
+        runner = goldfive.wrap(
+            agent,
+            judge_call_llm=judge_call_llm,
+            judge_model=judge_model,
+            **wrap_kwargs,
+        )
         return await runner.run(user_input, context=context)
 
-    Any keyword arguments other than ``context`` are forwarded to
-    :func:`wrap`. Does not call :meth:`Runner.close`; callers that
-    need deterministic sink teardown should build their own runner.
+    ``judge_call_llm`` and ``judge_model`` are forwarded to
+    :func:`wrap` as the dedicated built-in-judge route. All remaining
+    keyword arguments are also forwarded. This function does not call
+    :meth:`Runner.close`; callers that need deterministic sink teardown
+    should build their own runner.
     """
+    if judge_call_llm is not None:
+        wrap_kwargs["judge_call_llm"] = judge_call_llm
+    if judge_model is not None:
+        wrap_kwargs["judge_model"] = judge_model
     runner = wrap(agent, **wrap_kwargs)
     return await runner.run(user_input, context=context)
 
