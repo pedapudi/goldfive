@@ -1028,6 +1028,9 @@ message SteeringDecisionMade {
   //                          ``DriftDetected`` event is still emitted
   //                          for observability with the relevant
   //                          ``suppressed_*`` flag set.
+  // ``"drift_observed_only"`` — detector fired and emitted its paired
+  //                          ``DriftDetected``, but response dispatch was
+  //                          disabled before the intervention ladder.
   string outcome = 2;
   // One-line human-readable reason for the outcome — e.g.
   // ``"cosine 0.42 below 0.6 healthy bound"``, ``"observation_only=true"``,

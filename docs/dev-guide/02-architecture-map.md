@@ -269,6 +269,7 @@ The defaults branch on `judge_only` and on LLM availability:
 | planner | `LLMPlanner(call_llm, model)` | `StaticPlanner` (one framing task, `_build_judge_only_planner`) | `PassthroughPlanner` |
 | goal_deriver | `LLMGoalDeriver` | `LiteralGoalDeriver` (no LLM call) | `LiteralGoalDeriver` |
 | executor | `SequentialExecutor(max_task_invocations=..., overlay_mode=True)` | same | same |
+| steerer | `DefaultSteerer` with normal drift dispatch | `DefaultSteerer(dispatch_drift_interventions=False)` | `DefaultSteerer` with normal drift dispatch |
 
 `overlay_mode=True` is the `wrap()` default (goldfive#141). An explicit
 `executor=` keeps full control.
@@ -279,6 +280,13 @@ judge_call_llm is not None / else` block in `convenience.py`. When no judge
 callable is available and `reasoning_drift_mode in ("judge","both")`, `wrap` logs a
 WARNING that LLM drift detection is disabled. Deep dive on the steerer:
 `09-steering-ladder-and-gates.md`.
+
+Judge-only mode changes the default steerer's response policy without changing
+its detectors, custom-judge list, runtime detector configuration, or judge LLM
+route. Each verdict can still emit `JudgementEmitted` and `DriftDetected`.
+The steerer returns before freshness bookkeeping, cancellation, promotion, the
+intervention ladder, refinement, and escalation. An explicit `steerer=` keeps
+the caller's policy.
 
 ### 1.6 Judges installation and the Runner
 

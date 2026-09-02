@@ -294,22 +294,22 @@ def wrap(
         Pass ``True`` to restore the full pre-#196 set, or a list of
         drift tool names to enable a subset.
     judge_only:
-        First-class JUDGE-ONLY mode. Default ``False`` — behaviour is
-        byte-identical to today (the full planning overlay runs:
+        Judge-only mode. Default ``False`` runs the full planning overlay:
         goal-derivation, per-turn planning, refine, and drift-reactive
-        steering).
+        steering.
 
-        When ``True`` the wrapped agent runs NATIVELY while the drift
-        judges stay armed, and NO planning / steering LLM call is ever
-        issued (no goal-derive, no plan / refine, no drift-reactive
-        steering). This is the mode an evaluation / benchmarking harness
-        wants: judge an agent's own NATIVE behaviour without goldfive
-        steering it.
+        When ``True``, the wrapped agent runs natively while built-in and
+        custom judges remain active. Judgement and drift events retain their
+        usual structure. The default steerer stops each drift before the
+        intervention ladder, so the run cannot cancel work, enqueue a
+        corrective message, refine a plan, or escalate in response to drift.
+        Goal derivation and planning also avoid LLM calls.
 
         It is a convenience that sets the defaults for ``planner`` and
-        ``goal_deriver``; it does NOT touch the judges (they remain wired
-        through the same ``judge_call_llm`` / ``call_llm`` / detected
-        tree LLM / ``JudgeConfig`` resolution used in full mode).
+        ``goal_deriver`` and disables drift-response dispatch on the default
+        steerer. It leaves detector configuration, the judge list, and
+        ``judge_call_llm`` / ``call_llm`` / detected tree LLM /
+        ``JudgeConfig`` routing unchanged.
         Concretely, when the caller did not supply them:
 
         * ``planner`` defaults to a :class:`StaticPlanner` carrying a
@@ -324,12 +324,12 @@ def wrap(
           wraps the user input as a single goal WITHOUT an LLM call (vs
           the goal-derive LLM call :class:`LLMGoalDeriver` would make).
 
-        An explicit ``planner=`` / ``goal_deriver=`` / ``steerer=`` still
-        wins — ``judge_only`` only supplies the defaults. Note that
-        ``SteeringConfig.observation_only`` does NOT achieve this: it
-        gates only the three drift-reactive INJECTION points, while the
-        planner's goal-derivation / per-turn planning / refine still run
-        and burn LLM calls.
+        Explicit ``planner=`` and ``goal_deriver=`` values still win while
+        the default steerer remains response-free. An explicit ``steerer=``
+        owns its response policy and is not modified. The separate
+        ``SteeringConfig.observation_only`` setting gates state mutation and
+        message injection after the response policy has already run; dry-run
+        refinement and its LLM calls therefore continue in that mode.
 
     Returns
     -------
@@ -615,6 +615,7 @@ def wrap(
             reasoning_drift_call_llm=resolved_judge_call_llm,
             reasoning_drift_model=resolved_judge_model,
             steering_config=resolved_runtime.steering,
+            dispatch_drift_interventions=not judge_only,
         )
     else:
         resolved_steerer = DefaultSteerer(
@@ -623,6 +624,7 @@ def wrap(
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
             steering_config=resolved_runtime.steering,
+            dispatch_drift_interventions=not judge_only,
         )
         # Judges inherit ``call_llm`` from :func:`goldfive.wrap`; with
         # no callable wired here, both the trajectory-level GOAL_DRIFT

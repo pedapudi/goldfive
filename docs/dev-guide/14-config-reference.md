@@ -570,7 +570,7 @@ arguments and all remaining keywords to `wrap()`.
 | `runtime` | `RuntimeConfig \| None` | `None` → `RuntimeConfig.from_env()` | The typed-config aggregate. See §1. |
 | `dynamic_instruction` | `bool` | `True` | goldfive#251. Replaces each reachable `LlmAgent`'s static `instruction` with a callable resolver re-reading current-task context from `session.state` every turn (plan-causal prompting; #477 preserves ADK `{var}` templating via `inject_session_state`). `False` keeps static strings. Ignored for non-ADK. |
 | `drift_self_reporting` | `bool \| list[str]` | `False` | goldfive#196. `False`: lifecycle reporting tools only. `True`: full pre-#196 set incl. drift opinions. `list[str]`: lifecycle subset + named drift tools. Forwarded to `Runner`. |
-| `judge_only` | `bool` | `False` | First-class JUDGE-ONLY mode (#446). `True` → native un-steered run with judges armed and ZERO planning/steering LLM calls. Sets defaults for `planner` (one-task `StaticPlanner`) and `goal_deriver` (`LiteralGoalDeriver`); does NOT touch judges. Explicit `planner=`/`goal_deriver=`/`steerer=` still win. |
+| `judge_only` | `bool` | `False` | Runs the native agent with built-in and custom judges active. The default steerer emits judgement and drift evidence while skipping cancellation, corrective messages, refinement, and escalation. Sets `planner` to a one-task `StaticPlanner` and `goal_deriver` to `LiteralGoalDeriver` when the caller omits them. An explicit `steerer=` retains its own policy. |
 | `llm_detector` | `Any` | `None` | Test seam: replaces `detect_llm` for this call. Leave `None` in production. |
 | `judge_call_llm_builder` | `Any` | `None` | Test seam: replaces `_build_judge_call_llm`. Leave `None` in production. |
 | `judges` | `list[Any] \| None` | `None` → `default_judges()` | goldfive#437. Custom `Judge` list. `[]` opts out of the `JudgementEmitted` envelope surface (legacy hardcoded detector path still runs). Mutually exclusive with `disable_judges`. |
@@ -579,7 +579,7 @@ arguments and all remaining keywords to `wrap()`.
 
 ### `judge_only` vs `observation_only` — do not confuse them
 
-`SteeringConfig.observation_only` gates only the three drift-reactive INJECTION points — the planner's goal-derivation, per-turn planning, and refine STILL run and burn LLM calls. `judge_only=True` additionally swaps in a `StaticPlanner` + `LiteralGoalDeriver` so ZERO planning/steering LLM calls fire. If your goal is "judge the agent's native behaviour with no goldfive LLM spend on planning", use `judge_only`, not `observation_only`. (Why a one-task `StaticPlanner` and not `PassthroughPlanner`: `PassthroughPlanner.generate` returns `None`, so the Runner has no plan and the run aborts with an EMPTY transcript — nothing for the judges to score. `StaticPlanner` returns a baked single-task plan that drives ONE `invoke_passthrough` and whose `refine` returns `None`, so a real transcript is produced with no refine/steer call.)
+`SteeringConfig.observation_only` gates state mutation and message injection after the response policy has run. Goal derivation, per-turn planning, and dry-run refinement can therefore make LLM calls. `judge_only=True` uses a `StaticPlanner`, a `LiteralGoalDeriver`, and a default steerer that returns before the intervention ladder. A one-task `StaticPlanner` is required because `PassthroughPlanner.generate` returns `None`, which leaves the Runner with no plan and no transcript for the judges to score.
 
 ### Why the default executor is overlay mode
 
@@ -599,7 +599,7 @@ When `agent` is an ADK `BaseAgent`, `wrap()` returns a `GoldfiveADKAgent` (a `Ba
 | `call_llm=` + `runtime=RuntimeConfig(judge=JudgeConfig(base_url=...))` | `call_llm=` wins for the judges when `judge_call_llm` is absent. `JudgeConfig.base_url` is ignored. |
 | `judges=[...]` + `disable_judges=[...]` | `TypeError`. They are mutually exclusive — an explicit `judges=` already spells out the exact set. |
 | `judges=[]` (empty) | Opts out of the `JudgementEmitted` envelope surface. The legacy hardcoded detector path STILL runs and still fires `DriftDetected`; you just lose the new judge-envelope events. |
-| `planner=` + `judge_only=True` | Your explicit `planner=` wins; `judge_only` only supplies DEFAULTS for `planner`/`goal_deriver`. Same for explicit `goal_deriver=` / `steerer=`. |
+| `planner=` + `judge_only=True` | The explicit planner runs the native framing work, but drift cannot invoke its `refine` method through the default steerer. An explicit `goal_deriver=` also wins. An explicit `steerer=` retains its own response policy. |
 | `max_task_invocations=N` with an explicit `executor=` | The `N` is still passed to the `Runner`, but your executor was built by YOU without it — pass `max_task_invocations=N` to your executor's constructor too, or the executor won't enforce it. |
 | `sinks=[]` (empty) vs `sinks=None` | `[]` suppresses ALL sinks (including the default `LoggingSink`). `None` gets the `[LoggingSink()]` default. A bare `Runner` (not via `wrap()`) defaults to `[]`. |
 | `dynamic_instruction=True` on a non-ADK agent | No-op. The resolver installer only touches `LlmAgent.instruction`; other tree shapes are silently skipped. |
@@ -1343,7 +1343,9 @@ This is how the ~90 active-mode tests opt in (#488). It is fine per-Runner; chan
 ```python
 runner = goldfive.wrap(tree, judge_only=True, call_llm=my_judge_llm)
 ```
-Do NOT use `observation_only` for this — that still burns planning/goal-derive/refine LLM calls. See §10.
+`observation_only` still permits planning, goal-derivation, and dry-run refine
+LLM calls. Use `judge_only` when the run should spend only on the agent and its
+configured judges. See §10.
 
 ### Load from env, then tweak one field (the blessed mutation pattern)
 

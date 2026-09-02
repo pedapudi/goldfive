@@ -624,7 +624,7 @@ The ledger's four counters are the honest accounting of whether judges earn thei
 
 ## 3.4 Judge-facade dispatch authority (deferred)
 
-**What:** giving a judge facade authority to dispatch interventions directly. **Deferred** — judges today produce verdicts; the steerer owns dispatch. **Interim rule:** keep the judge/steerer separation strict. A `Judge` (`goldfive/protocols.py`, the pluggable protocol from #439) returns a typed `JudgeVerdict` (enum-typed `drift_kind`/`severity`, #443) and emits a `JudgementEmitted` event; it does **not** call cancel/nudge/plan-install. The steerer consumes the verdict and decides the intervention (and gates it on `observation_only`). A weak model tempted to "let the judge just cancel the run when it's confident" is collapsing this separation — the judge is fallible (that's why steering is the conditional half, Section 5.9), so its output is *advice to the steerer*, never a direct actuator. This separation is also what makes judge-only mode (#446) possible: judges run with no steerer/overlay at all because they have no dispatch authority to exercise.
+**What:** giving a judge facade authority to dispatch interventions directly. **Deferred** — judges today produce verdicts; the steerer owns dispatch. **Interim rule:** keep the judge/steerer separation strict. A `Judge` (`goldfive/protocols.py`, the pluggable protocol from #439) returns a typed `JudgeVerdict` (enum-typed `drift_kind`/`severity`, #443) and emits a `JudgementEmitted` event; it does **not** call cancel/nudge/plan-install. The steerer consumes the verdict and decides the intervention (and gates it on `observation_only`). A weak model tempted to "let the judge just cancel the run when it's confident" is collapsing this separation — the judge is fallible (that's why steering is the conditional half, Section 5.9), so its output is *advice to the steerer*, never a direct actuator. This separation also makes judge-only mode possible: the default steerer retains detector and event handling while its drift-response dispatch is disabled.
 
 ## 3.5 Stage-4 actuators: checkpoint-rollback / tool-gating hold / fork-and-judge (bench-gated, unbuilt)
 
@@ -993,9 +993,9 @@ The `python_attr` is how zicato *imports and sets* the knob at runtime; the `sou
 | --- | --- | --- | --- |
 | **Active steering** | `wrap(..., RuntimeConfig(steering=SteeringConfig(observation_only=False)))` | Everything: detection, judges, planning overlay, interventions. | — |
 | **Observation-only** (default) | shipped default (`observation_only=True`) | Detection, judges, `planner.refine_steer` (dry_run), full telemetry. | Interventions (the Section 1.5.1 write-paths). |
-| **Judge-only** | `wrap(..., judge_only=True)` (#446) | A **native** agent run + judges only; a `StaticPlanner` synthesizes a single-task plan (`_JUDGE_ONLY_TASK_ID`). | The planning/steering overlay entirely — no refine, no ladder. |
+| **Judge-only** | `wrap(..., judge_only=True)` | A native agent run with built-in and custom judges. A `StaticPlanner` supplies one framing task, and the default steerer emits judgement and drift events. | The default steerer returns before cancellation, promotion, the intervention ladder, refinement, and escalation. |
 
-`observation_only` suppresses the *write-paths* but keeps the planning/steering *machinery* running (dry_run); judge-only removes the *machinery*. A weak model asked to "just grade a run" wants **judge-only**, not `observation_only`. `disable_judges=[...]` (a typed `BuiltinJudge` selector, #444) further trims which builtin judges run.
+`observation_only` suppresses writes after the planning and steering machinery has run, including dry-run refinement. Judge-only keeps the observation machinery and removes the response machinery. `disable_judges=[...]` further trims which built-in judges run.
 
 ## 5.9 The agency-preservation branch (#449–#474, unmerged)
 
