@@ -13,6 +13,7 @@ All tests mock out the HTTP layer -- we never hit a real endpoint.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -103,6 +104,32 @@ def test_openai_backend_env_driven(
         assert abs(sim) < 1e-6
     finally:
         _embed.set_backend_loader(None)
+
+
+def test_explicit_local_embedding_config_ignores_environment_url(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
+) -> None:
+    """A typed ``base_url=None`` selects local discovery, not ambient HTTP."""
+    goldfive_embedding_env.set(base_url="http://ambient.example")
+    requested_urls: list[str] = []
+    _embed.set_backend_loader(lambda url: requested_urls.append(url))
+    request.addfinalizer(lambda: _embed.set_backend_loader(None))
+
+    local_model = _FakeBackend({})
+
+    class _SentenceTransformers:
+        @staticmethod
+        def SentenceTransformer(model_name: str) -> Any:
+            assert model_name
+            return local_model
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", _SentenceTransformers())
+    _embed.configure(EmbeddingConfig(base_url=None))
+
+    assert _embed._get_model() is local_model
+    assert requested_urls == []
 
 
 def test_openai_backend_response_parsing() -> None:
