@@ -142,6 +142,8 @@ def test_every_runtime_behavior_field_has_one_document_field() -> None:
     assert "capability_rule_a" not in rendered
     assert "capability_rule_c" not in rendered
     assert "legacy_ladder" not in rendered
+    assert "legacy_user_message" not in rendered
+    assert _group(RuntimeConfigDocument.scaffold(), "steering")["signal_channel"] == "user_message"
 
 
 @pytest.mark.parametrize(
@@ -151,13 +153,18 @@ def test_every_runtime_behavior_field_has_one_document_field() -> None:
         {"agent": {"unknown": True}},
         {"agent": {"call_timeout_ms": True}},
         {"agent": {"call_timeout_ms": -1}},
+        {"tool_loops": {"window": 10**10_000}},
+        {"judge": {"base_url": "https://judge.example", "timeout_ms": 10**10_000}},
         {"reasoning_drift": {"mode": "automatic"}},
         {"reasoning_drift": {"off_topic_distance_threshold": float("nan")}},
+        {"reasoning_drift": {"off_topic_distance_threshold": 10**10_000}},
         {"reasoning_drift": {"intent_divergence_warning_similarity": -1.01}},
         {"reasoning_drift": {"looping_reasoning_similarity_threshold": float("inf")}},
         {"steering": {"context_editor_rules": ("prune_stale_steer",)}},
         {"steering": {"context_editor_rules": ["unknown_rule"]}},
+        {"steering": {"signal_channel": "legacy_user_message"}},
         {"steering": {"stall_timeout_s": float("inf")}},
+        {"steering": {"pause_escalate_deadline_s": 10**10_000}},
         {"judge": {"api_key": "must-never-be-accepted"}},
         {"judge": {"api_key_env": "JUDGE_KEY"}},
         {"embedding": {"revision": "model-v1"}},
@@ -232,6 +239,14 @@ def test_negative_finite_stall_timeout_is_valid() -> None:
     assert runtime.steering.stall_timeout_s == -1
 
 
+def test_public_user_message_channel_builds_internal_compatibility_value() -> None:
+    runtime = RuntimeConfigDocument.from_mapping(
+        {"steering": {"signal_channel": "user_message"}}
+    ).build(resolve_secret=lambda _name: None)
+
+    assert runtime.steering.signal_channel == "legacy_user_message"
+
+
 def test_credentials_resolve_only_during_build_without_disclosure() -> None:
     secret = "credential-that-must-not-leak"
     calls: list[str] = []
@@ -298,6 +313,13 @@ def test_endpoint_urls_reject_userinfo_query_fragment_and_v1_suffix(url: str, gr
         ({"judge": {"base_url": "https://judge.example"}}, frozenset({"remote"})),
         (
             {"embedding": {"base_url": "https://embedding.example"}},
+            frozenset(),
+        ),
+        (
+            {
+                "reasoning_drift": {"mode": "embedding"},
+                "embedding": {"base_url": "https://embedding.example"},
+            },
             frozenset({"remote"}),
         ),
         (
@@ -322,10 +344,15 @@ def test_required_extras_follow_selected_backends(
 def test_missing_runtime_capabilities_follow_backend_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    available: set[str] = set()
-    monkeypatch.setattr(document_module, "_module_available", available.__contains__)
+    available: set[tuple[str, str]] = set()
+    monkeypatch.setattr(
+        document_module,
+        "_runtime_symbol_available",
+        lambda module_name, symbol_name: (module_name, symbol_name) in available,
+    )
     document = RuntimeConfigDocument.from_mapping(
         {
+            "reasoning_drift": {"mode": "embedding"},
             "judge": {"base_url": "https://judge.example"},
             "embedding": {"base_url": "https://embedding.example"},
         }
@@ -335,14 +362,14 @@ def test_missing_runtime_capabilities_follow_backend_fallbacks(
         "remote_embedding",
     )
 
-    available.add("httpx")
+    available.add(("httpx", "Client"))
     assert document.missing_runtime_capabilities() == ("remote_judge",)
-    available.add("openai")
+    available.add(("openai", "AsyncOpenAI"))
     assert document.missing_runtime_capabilities() == ()
 
     local = RuntimeConfigDocument.from_mapping({"reasoning_drift": {"mode": "embedding"}})
     assert local.missing_runtime_capabilities() == ("local_embedding",)
-    available.add("sentence_transformers")
+    available.add(("sentence_transformers", "SentenceTransformer"))
     assert local.missing_runtime_capabilities() == ()
 
 
@@ -351,11 +378,11 @@ def test_capability_probe_imports_only_selected_backends(
 ) -> None:
     calls: list[str] = []
 
-    def module_available(name: str) -> bool:
-        calls.append(name)
+    def runtime_symbol_available(module_name: str, symbol_name: str) -> bool:
+        calls.append(f"{module_name}.{symbol_name}")
         return True
 
-    monkeypatch.setattr(document_module, "_module_available", module_available)
+    monkeypatch.setattr(document_module, "_runtime_symbol_available", runtime_symbol_available)
 
     assert RuntimeConfigDocument.from_mapping({}).missing_runtime_capabilities() == ()
     assert calls == []
@@ -367,16 +394,23 @@ def test_capability_probe_rejects_an_importable_but_broken_dependency(
     """A discoverable package that raises during import remains unavailable."""
     calls: list[str] = []
 
+    class CompatibleHttpx:
+        class Client:
+            pass
+
+    class IncompatibleOpenAI:
+        AsyncOpenAI = None
+
     def import_module(name: str) -> object:
         calls.append(name)
         if name == "openai":
-            raise RuntimeError("broken installation")
-        return object()
+            return IncompatibleOpenAI()
+        return CompatibleHttpx()
 
     monkeypatch.setattr(document_module.importlib, "import_module", import_module)
 
-    assert document_module._module_available("openai") is False
-    assert document_module._module_available("httpx") is True
+    assert document_module._runtime_symbol_available("openai", "AsyncOpenAI") is False
+    assert document_module._runtime_symbol_available("httpx", "Client") is True
     assert calls == ["openai", "httpx"]
 
 

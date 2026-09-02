@@ -17,6 +17,9 @@ names:
 * ``cancel_and_reinvoke_interventions_enabled`` controls the behavior stored
   internally as ``legacy_ladder``.
 
+The public ``steering.signal_channel`` value ``user_message`` builds the
+internal compatibility value ``legacy_user_message``.
+
 Endpoint ``revision`` values remain document metadata for callers that use
 them in configuration identity. ``RuntimeConfig`` has no corresponding field,
 so :meth:`RuntimeConfigDocument.build` does not pass revisions to the runtime.
@@ -52,6 +55,12 @@ __all__ = ["JsonValue", "RuntimeConfigDocument", "SecretResolver"]
 
 _Validator: TypeAlias = Callable[[object, str], JsonValue]
 
+# Keep persisted-document validity independent of the host's pointer width.
+# Every runtime integer is a count, timeout in milliseconds, or bounded window;
+# the signed 32-bit ceiling exceeds their useful range and is safe at process
+# boundaries on every supported host.
+_MAX_RUNTIME_INTEGER = (1 << 31) - 1
+
 
 def _type_error(path: str, expected: str) -> ValueError:
     return ValueError(f"{path} must be {expected}")
@@ -79,8 +88,11 @@ def _optional_nonempty_string(value: object, path: str) -> str | None:
 
 def _integer_at_least(minimum: int) -> _Validator:
     def validate(value: object, path: str) -> int:
-        if type(value) is not int or value < minimum:
-            raise _type_error(path, f"an integer greater than or equal to {minimum}")
+        if type(value) is not int or value < minimum or value > _MAX_RUNTIME_INTEGER:
+            raise _type_error(
+                path,
+                f"an integer from {minimum} through {_MAX_RUNTIME_INTEGER}",
+            )
         return value
 
     return validate
@@ -90,7 +102,10 @@ def _finite_number(*, minimum: float | None = None, maximum: float | None = None
     def validate(value: object, path: str) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _type_error(path, "a finite number")
-        result = float(value)
+        try:
+            result = float(value)
+        except OverflowError:
+            raise _type_error(path, "a finite number") from None
         if not math.isfinite(result):
             raise _type_error(path, "a finite number")
         if minimum is not None and result < minimum:
@@ -107,7 +122,10 @@ def _optional_positive_number(value: object, path: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _type_error(path, "null or a finite positive number")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        raise _type_error(path, "null or a finite positive number") from None
     if not math.isfinite(result) or result <= 0:
         raise ValueError(f"{path} must be greater than 0 when set")
     return result
@@ -204,6 +222,11 @@ _STEERING_DOCUMENT_TO_RUNTIME = {
     "cancel_and_reinvoke_interventions_enabled": "legacy_ladder",
 }
 
+_STEERING_SIGNAL_DOCUMENT_TO_RUNTIME = {
+    "user_message": "legacy_user_message",
+    "request_context": "request_context",
+}
+
 _FIELD_VALIDATORS: dict[str, _Validator] = {
     "embedding.base_url": _base_url,
     "embedding.revision": _optional_nonempty_string,
@@ -230,7 +253,7 @@ _FIELD_VALIDATORS: dict[str, _Validator] = {
     "steering.threshold": _one_of("off", "warning", "critical"),
     "steering.context_editor_rules": _context_editor_rules,
     "steering.cancel_inflight_scope": _one_of("user_and_safety", "all"),
-    "steering.signal_channel": _one_of("legacy_user_message", "request_context"),
+    "steering.signal_channel": _one_of(*_STEERING_SIGNAL_DOCUMENT_TO_RUNTIME),
     "steering.plan_mode": _one_of("forecast", "ledger"),
     "steering.pause_escalate_deadline_s": _optional_positive_number,
     "steering.stall_timeout_s": _finite_number(),
@@ -261,6 +284,8 @@ def _hard_defaults() -> dict[str, JsonValue]:
                 for document_name, runtime_name in _STEERING_DOCUMENT_TO_RUNTIME.items()
             }
             group = {runtime_to_document.get(key, key): value for key, value in group.items()}
+            if group["signal_channel"] == "legacy_user_message":
+                group["signal_channel"] = "user_message"
         document[group_name] = group
 
     # RuntimeConfig keeps these values nullable for low-level environment
@@ -395,6 +420,10 @@ def _build_runtime_groups(
             kwargs["api_key"] = (
                 resolved_credentials[reference] if isinstance(reference, str) else None
             )
+        if name == "steering":
+            signal_channel = kwargs["signal_channel"]
+            assert isinstance(signal_channel, str)
+            kwargs["signal_channel"] = _STEERING_SIGNAL_DOCUMENT_TO_RUNTIME[signal_channel]
         groups[name] = config_type(**kwargs)
     return groups
 
@@ -452,12 +481,13 @@ def _resolved_document(
     return result
 
 
-def _module_available(name: str) -> bool:
+def _runtime_symbol_available(module_name: str, symbol_name: str) -> bool:
     try:
-        importlib.import_module(name)
+        module = importlib.import_module(module_name)
+        symbol = getattr(module, symbol_name)
     except Exception:  # noqa: BLE001 - broken optional installs are unavailable
         return False
-    return True
+    return callable(symbol)
 
 
 @dataclasses.dataclass(frozen=True, slots=True, init=False)
@@ -520,9 +550,12 @@ class RuntimeConfigDocument:
         embedding = _group(self._document, "embedding")
         judge = _group(self._document, "judge")
         reasoning = _group(self._document, "reasoning_drift")
-        if judge["base_url"] is not None or embedding["base_url"] is not None:
+        embedding_active = reasoning["mode"] in {"embedding", "both"}
+        if judge["base_url"] is not None or (
+            embedding_active and embedding["base_url"] is not None
+        ):
             required.add("remote")
-        if reasoning["mode"] in {"embedding", "both"} and embedding["base_url"] is None:
+        if embedding_active and embedding["base_url"] is None:
             required.add("embedding")
         return frozenset(required)
 
@@ -539,18 +572,20 @@ class RuntimeConfigDocument:
         judge = _group(self._document, "judge")
         reasoning = _group(self._document, "reasoning_drift")
         has_remote_judge = judge["base_url"] is not None
-        has_remote_embedding = embedding["base_url"] is not None
-        openai_available = (
-            _module_available("openai") if has_remote_judge or has_remote_embedding else False
-        )
-        if has_remote_judge and not openai_available:
+        embedding_active = reasoning["mode"] in {"embedding", "both"}
+        has_remote_embedding = embedding_active and embedding["base_url"] is not None
+        if has_remote_judge and not _runtime_symbol_available("openai", "AsyncOpenAI"):
             missing.append("remote_judge")
-        if has_remote_embedding and not openai_available and not _module_available("httpx"):
+        if (
+            has_remote_embedding
+            and not _runtime_symbol_available("openai", "OpenAI")
+            and not _runtime_symbol_available("httpx", "Client")
+        ):
             missing.append("remote_embedding")
         if (
-            reasoning["mode"] in {"embedding", "both"}
+            embedding_active
             and embedding["base_url"] is None
-            and not _module_available("sentence_transformers")
+            and not _runtime_symbol_available("sentence_transformers", "SentenceTransformer")
         ):
             missing.append("local_embedding")
         return tuple(missing)

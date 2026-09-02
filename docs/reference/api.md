@@ -117,6 +117,8 @@ The document has the same nested groups as `RuntimeConfig`. Use
 `RuntimeConfigDocument.scaffold()` to obtain the complete canonical mapping.
 Omitted fields receive fixed library defaults. The `defaults` mapping is
 validated first, then the operator mapping overlays it recursively.
+Integer fields use their runtime-specific lower bound and a stable maximum of
+`2147483647`, so document validity does not depend on the host architecture.
 
 Three document fields replace compatibility-oriented internal names:
 
@@ -125,6 +127,10 @@ Three document fields replace compatibility-oriented internal names:
 | `delegation_only_agent_leaf_task_detector_enabled` | `capability_rule_a_enabled` |
 | `pending_task_role_mismatch_detector_enabled` | `capability_rule_c_enabled` |
 | `cancel_and_reinvoke_interventions_enabled` | `legacy_ladder` |
+
+The document value `steering.signal_channel="user_message"` builds the
+compatibility value `SteeringConfig.signal_channel="legacy_user_message"`.
+Persisted documents do not expose the compatibility value.
 
 Six persisted defaults differ from nullable compatibility fields on
 `RuntimeConfig()`:
