@@ -116,8 +116,14 @@ Optional extras:
 
 - `goldfive[adk]` — Google ADK adapter (`google-adk`).
 - `goldfive[claude]` — Claude Agent SDK adapter (`anthropic`).
+- `goldfive[remote]` — OpenAI-compatible HTTP judge and embedding backends
+  (`openai`, with `httpx` fallback for embeddings).
+- `goldfive[embedding]` — local sentence-transformer embeddings
+  (`sentence-transformers`).
+- `goldfive[events]` — JSONL, logging, and SQLite event sinks (`protobuf`).
 - `goldfive[examples]` — runtime deps for the scripts in [`examples/`](examples/) (`rich`).
-- `goldfive[proto]` — regenerate proto stubs with `make proto` (`grpcio`, `grpcio-tools`, `mypy-protobuf`).
+- `goldfive[proto]` — gRPC event transport and proto regeneration with
+  `make proto` (`protobuf`, `grpcio`, `grpcio-tools`, `mypy-protobuf`).
 - `goldfive[dev]` — test + lint tooling used by the repo itself (`pytest`, `ruff`, `mypy`, ...).
 
 ## Hello goldfive

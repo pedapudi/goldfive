@@ -43,6 +43,13 @@ dev = [
 embedding = [
     "sentence-transformers>=3.0",
 ]
+events = [
+    "protobuf>=6.31.1",
+]
+remote = [
+    "httpx>=0.27",
+    "openai>=1.0",
+]
 examples = [
     "rich>=13.0",
 ]
@@ -50,6 +57,7 @@ proto = [
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "mypy-protobuf>=3.5",
+    "protobuf>=6.31.1",
 ]
 
 [project.urls]
