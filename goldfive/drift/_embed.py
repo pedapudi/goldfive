@@ -278,9 +278,13 @@ def _get_model() -> Any | None:
     Preference order (first match wins):
 
     1. A test- or caller-installed model via :func:`set_model`.
-    2. An OpenAI-compatible HTTP backend when
-       ``GOLDFIVE_EMBEDDING_BASE_URL`` is set in the environment.
-    3. A ``sentence-transformers`` model loaded from the
+    2. The backend selected by an installed
+       :class:`~goldfive.config.EmbeddingConfig`. A configured URL selects
+       the OpenAI-compatible HTTP backend; a configured ``None`` selects
+       local discovery.
+    3. An OpenAI-compatible HTTP backend selected by
+       ``GOLDFIVE_EMBEDDING_BASE_URL`` when no typed config is installed.
+    4. A ``sentence-transformers`` model loaded from the
        ``goldfive[embedding]`` extra.
 
     The first failed path flips ``_MODEL_UNAVAILABLE`` so subsequent
@@ -310,13 +314,12 @@ def _get_model() -> Any | None:
     if _MODEL is not None:
         return _MODEL
 
-    # Prefer an installed RuntimeConfig over env vars (goldfive#225).
-    # When ``configure()`` has been called with a non-None base_url,
-    # its values win; otherwise we fall back to env lookup to preserve
-    # the pre-#225 contract for callers that never touched the new API.
-    base_url = ""
-    if _CONFIG is not None and _CONFIG.base_url:
-        base_url = _CONFIG.base_url.strip()
+    # An installed RuntimeConfig is authoritative (goldfive#225), including
+    # ``base_url=None``: that value selects local discovery. Environment
+    # lookup remains the compatibility path only for callers that never
+    # installed a typed config.
+    if _CONFIG is not None:
+        base_url = (_CONFIG.base_url or "").strip()
     else:
         base_url = os.environ.get("GOLDFIVE_EMBEDDING_BASE_URL", "").strip()
     if base_url:
