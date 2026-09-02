@@ -669,6 +669,9 @@ wheels = [
 name = "goldfive"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "protobuf" },
+]
 
 [package.optional-dependencies]
 adk = [
@@ -688,9 +691,6 @@ dev = [
 ]
 embedding = [
     { name = "sentence-transformers" },
-]
-events = [
-    { name = "protobuf" },
 ]
 examples = [
     { name = "rich" },
@@ -718,8 +718,8 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "mypy-protobuf", marker = "extra == 'proto'", specifier = ">=3.5" },
     { name = "openai", marker = "extra == 'remote'", specifier = ">=1.0" },
+    { name = "protobuf", specifier = ">=6.31.1" },
     { name = "protobuf", marker = "extra == 'dev'", specifier = ">=4.25" },
-    { name = "protobuf", marker = "extra == 'events'", specifier = ">=6.31.1" },
     { name = "protobuf", marker = "extra == 'proto'", specifier = ">=6.31.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -727,7 +727,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "sentence-transformers", marker = "extra == 'embedding'", specifier = ">=3.0" },
 ]
-provides-extras = ["adk", "claude", "dev", "embedding", "events", "remote", "examples", "proto"]
+provides-extras = ["adk", "claude", "dev", "embedding", "remote", "examples", "proto"]
 
 [[package]]
 name = "google-adk"
