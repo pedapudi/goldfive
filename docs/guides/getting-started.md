@@ -39,6 +39,9 @@ Optional extras (only install what you need):
 ```bash
 uv sync --extra adk       # google-adk integration
 uv sync --extra claude    # claude-agent-sdk integration
+uv sync --extra remote    # OpenAI-compatible HTTP judge and embedding endpoints
+uv sync --extra embedding # local sentence-transformer embeddings
+uv sync --extra events    # JSONL, logging, and SQLite event sinks
 uv sync --extra dev       # dev tools (pytest, ruff, mypy)
 uv sync --extra examples  # example-specific deps
 ```
