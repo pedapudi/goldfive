@@ -107,8 +107,11 @@ def wrap(
 ```
 
 `goldfive.wrap(agent)` returns a `Runner` (`goldfive/runner.py`); `await runner.run(user_input)`
-executes one run. `judge_only=True` (PR #446) skips planning/steering overlay entirely and
-runs the native tree with judges attached — the minimal-footprint mode.
+executes one run. `judge_only=True` runs the native tree with judges attached.
+The default steerer emits judgement and drift evidence, then stops before the
+intervention ladder. Planning LLM calls and drift-response actions therefore
+stay out of the run. A one-task `StaticPlanner` still installs the framing plan
+that the native agent executes.
 
 ## The pipeline at a glance: observe → detect → intervene
 
@@ -387,7 +390,7 @@ absorbing predecessor is definitionally unexecutable — `Plan.validate` step 7,
 | **Drift self-reporting** | Opt-in tool surface (`wrap(drift_self_reporting=True or [names])`) exposing `DRIFT_SELF_REPORTING_TOOLS` so a WILLING agent can report divergence itself — an accelerant on top of, never a substitute for, observation (invariant 1). | `goldfive/reporting/__init__.py::DRIFT_SELF_REPORTING_TOOLS` |
 | **Reasoning history** | `Session.reasoning_history` — bounded ring (default max 20) of thinking blocks fed by `adapter.emit_reasoning`; the input surface for every reasoning detector and judge. | `goldfive/types.py::Session.reasoning_history` |
 | **Orchestration state** | The `goldfive.*`-prefixed key namespace on session state, bridged to ADK's `session.state` via `goldfive/adapters/_adk_state_protocol.py`; ALL reads/writes go through `goldfive/state_store.py` accessors (never raw dict access — see 11-state-ownership.md). | `goldfive/state_store.py` |
-| **Judge-only mode** | `wrap(judge_only=True)` (#446): native run + judges; no planning or steering overlay at all. The minimal way to get verdict telemetry on an untouched tree. | `goldfive/convenience.py::_build_judge_only_planner` |
+| **Judge-only mode** | `wrap(judge_only=True)`: native run with built-in and custom judges active. The default steerer emits judgement and drift telemetry while skipping every drift response. | `goldfive/convenience.py::_build_judge_only_planner`; `goldfive.steerer.DefaultSteerer(dispatch_drift_interventions=False)` |
 
 ### Reporting tools: the canonical ten
 

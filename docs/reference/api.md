@@ -155,6 +155,7 @@ def wrap(
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
     drift_self_reporting: bool | list[str] = False,
+    judge_only: bool = False,
     llm_detector: Any = None,
     judge_call_llm_builder: Any = None,
     judges: list[Judge] | None = None,
@@ -179,6 +180,13 @@ shared `call_llm` route and `RuntimeConfig.judge`. `judge_model` changes
 the model name passed to those judges without changing the planner or
 goal deriver. Goldfive does not register a judge close hook for a
 caller-supplied callable; the caller retains ownership of its resources.
+
+`judge_only=True` runs the native agent while keeping built-in and custom
+judges active. The default steerer emits `JudgementEmitted`, `DriftDetected`,
+and the associated decision telemetry, then returns before cancellation,
+corrective-message delivery, the intervention ladder, planner refinement, or
+escalation. Runtime detector configuration and judge LLM routing are unchanged.
+An explicit `steerer=` retains its own response policy.
 
 `agent` can be any of:
 
@@ -763,6 +771,11 @@ class DefaultSteerer(Steerer):
     # DRIFT.md and STATE-MACHINE.md plus the six-level intervention
     # ladder. No required constructor args.
 ```
+
+`DefaultSteerer(dispatch_drift_interventions=False)` retains detection and
+event emission while returning before every drift response. `wrap` uses this
+setting on the default steerer in judge-only mode. The default value is `True`,
+so full runs and directly constructed steerers retain the intervention ladder.
 
 In addition to the `Steerer` protocol methods, `DefaultSteerer`
 exposes `mark_task_running`, `mark_task_progress`,

@@ -22,28 +22,37 @@ The suite pins:
 2. A ``judge_only=True`` run produces a NON-EMPTY transcript (the native
    agent executed; the run did NOT abort empty like PassthroughPlanner).
 3. The drift judges still fire under the judge-only steerer.
-4. Explicit ``planner=`` / ``goal_deriver=`` override under
-   ``judge_only=True``.
+4. Critical custom drift emits judgement and drift evidence without a
+   refine call or intervention event, while full mode still refines.
+5. Explicit component overrides retain their documented precedence.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
 import goldfive
 from goldfive import (
+    CallableAdapter,
+    DriftKind,
+    DriftSeverity,
     ExecutionOutcome,
     InMemorySink,
     InvocationResult,
+    JudgeContext,
+    JudgeVerdict,
     LiteralGoalDeriver,
     LLMGoalDeriver,
     LLMPlanner,
     PassthroughPlanner,
+    ReasoningDriftConfig,
     ReportingToolSpec,
+    RuntimeConfig,
     Session,
     StaticPlanner,
     Task,
@@ -102,6 +111,107 @@ def _make_drift_session() -> Session:
         plan=plan,
         current_task_id="t1",
     )
+
+
+class _RecordingPlanner(StaticPlanner):
+    """Planner that records drift responses and returns a valid revision."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            Plan(
+                id="recording-plan",
+                run_id="",
+                goal_ids=[],
+                tasks=[Task(id="t1", title="Native agent run")],
+                edges=[],
+            )
+        )
+        self.refine_calls: list[tuple[Plan, Any]] = []
+
+    async def refine(self, *, plan: Plan, drift: Any, **_: Any) -> Plan:
+        self.refine_calls.append((plan, drift))
+        revised_tasks = (
+            *plan.tasks,
+            Task(
+                id="t2",
+                title="Repair output schema",
+                description="Add the fields required by the output contract.",
+            ),
+        )
+        return replace(plan, tasks=revised_tasks, summary=f"{plan.summary} (refined)")
+
+
+class _CriticalSchemaJudge:
+    """Custom judge whose verdict enters the full-mode refine path."""
+
+    name = "critical_schema_judge"
+
+    def __init__(self) -> None:
+        self.calls: list[JudgeContext] = []
+
+    async def evaluate(self, ctx: JudgeContext) -> JudgeVerdict:
+        self.calls.append(ctx)
+        return JudgeVerdict(
+            drift_emitted=True,
+            drift_kind=DriftKind.SCHEMA_VIOLATION,
+            severity=DriftSeverity.CRITICAL,
+            detail="required output fields are missing",
+        )
+
+
+class _ReasoningAdapter(CallableAdapter):
+    """Adapter that emits one reasoning observation during invocation."""
+
+    def __init__(self) -> None:
+        super().__init__(self._invoke, available_agents=["schema_agent"])
+
+    async def _invoke(
+        self,
+        task: Task,
+        session: Session,
+        tools: list[ReportingToolSpec],
+    ) -> InvocationResult:
+        _ = tools
+        await self.emit_reasoning(
+            "The answer must satisfy the required output schema.",
+            task=task,
+            session=session,
+            agent_name="schema_agent",
+        )
+        return InvocationResult(task_id=task.id, text="native run completed")
+
+
+def _proto_payload_names(sink: InMemorySink) -> list[str]:
+    return [event.WhichOneof("payload") for event in sink.events if hasattr(event, "WhichOneof")]
+
+
+def _dict_event_kinds(sink: InMemorySink) -> list[str]:
+    return [str(event.get("kind", "")) for event in sink.events if isinstance(event, dict)]
+
+
+def _assert_critical_evidence_without_response(
+    sink: InMemorySink, planner: _RecordingPlanner
+) -> list[str]:
+    payloads = _proto_payload_names(sink)
+    assert payloads.count("judgement_emitted") == 1
+    assert payloads.count("drift_detected") == 1
+    assert planner.refine_calls == []
+    assert {
+        "ladder_transition_decided",
+        "policy_applied",
+        "signal_delivered",
+        "invocation_cancelled",
+    }.isdisjoint(payloads)
+    assert {"refine_attempted", "refine_failed"}.isdisjoint(_dict_event_kinds(sink))
+    decisions = [
+        event.steering_decision_made
+        for event in sink.events
+        if hasattr(event, "WhichOneof") and event.WhichOneof("payload") == "steering_decision_made"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].outcome == "drift_observed_only"
+    assert decisions[0].chosen_severity == ""
+    return payloads
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +404,78 @@ async def test_judge_only_steerer_still_fires_goal_drift_judge() -> None:
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
 
 
+async def test_judge_only_custom_critical_drift_emits_without_response() -> None:
+    """A critical custom verdict remains observable without intervention."""
+    planner = _RecordingPlanner()
+    sink = InMemorySink()
+    runner = goldfive.wrap(
+        _happy_agent,
+        judge_only=True,
+        planner=planner,
+        call_llm=_spy_call_llm([]),
+        model="fake-model",
+        judges=[_CriticalSchemaJudge()],
+        sinks=[sink],
+    )
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    steerer.bind(sinks=[sink], planner=planner)
+
+    session = _make_drift_session()
+    await steerer.evaluate_judges(JudgeContext(), session=session)
+
+    _assert_critical_evidence_without_response(sink, planner)
+
+
+async def test_judge_only_run_completes_after_critical_custom_verdict() -> None:
+    """The public run path drains critical evidence without responding."""
+    planner = _RecordingPlanner()
+    judge = _CriticalSchemaJudge()
+    sink = InMemorySink()
+
+    outcome = await goldfive.run(
+        _ReasoningAdapter(),
+        "produce the required object",
+        judge_only=True,
+        planner=planner,
+        judges=[judge],
+        sinks=[sink],
+        runtime=RuntimeConfig(reasoning_drift=ReasoningDriftConfig(mode="off")),
+    )
+
+    assert outcome.success, outcome.reason
+    assert len(judge.calls) == 1
+    payloads = _assert_critical_evidence_without_response(sink, planner)
+    assert payloads.count("plan_revised") == 1  # initial plan installation
+    judgement_index = payloads.index("judgement_emitted")
+    assert "plan_revised" not in payloads[judgement_index + 1 :]
+
+
+async def test_full_mode_custom_critical_drift_still_refines() -> None:
+    """The same custom verdict retains the full intervention policy."""
+    planner = _RecordingPlanner()
+    sink = InMemorySink()
+    runner = goldfive.wrap(
+        _happy_agent,
+        planner=planner,
+        call_llm=_spy_call_llm([]),
+        model="fake-model",
+        judges=[_CriticalSchemaJudge()],
+        sinks=[sink],
+    )
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    steerer.bind(sinks=[sink], planner=planner)
+
+    await steerer.evaluate_judges(JudgeContext(), session=_make_drift_session())
+
+    assert len(planner.refine_calls) == 1
+    assert "refine_attempted" in _dict_event_kinds(sink)
+    payloads = _proto_payload_names(sink)
+    assert payloads.count("judgement_emitted") == 1
+    assert payloads.count("drift_detected") == 1
+
+
 # ---------------------------------------------------------------------------
 # 4. Explicit planner / goal_deriver override under judge_only
 # ---------------------------------------------------------------------------
@@ -332,6 +514,21 @@ def test_judge_only_respects_explicit_goal_deriver() -> None:
         sinks=[],
     )
     assert runner.goal_deriver is explicit
+
+
+def test_judge_only_respects_explicit_steerer() -> None:
+    """An explicit steerer keeps its own drift-response policy."""
+    explicit = DefaultSteerer(dispatch_drift_interventions=True)
+    runner = goldfive.wrap(
+        _happy_agent,
+        judge_only=True,
+        steerer=explicit,
+        call_llm=_spy_call_llm([]),
+        model="fake-model",
+        sinks=[],
+    )
+    assert runner.steerer is explicit
+    assert explicit._dispatch_drift_interventions is True
 
 
 @pytest.mark.parametrize("judge_only", [True, False])

@@ -369,6 +369,7 @@ class DefaultSteerer:
         goldfive_steer_suppression_window_turns: int | None = None,
         cancel_inflight_scope: str | None = None,
         judges: list[Any] | None = None,
+        dispatch_drift_interventions: bool = True,
     ) -> None:
         """Build a steerer.
 
@@ -470,6 +471,15 @@ class DefaultSteerer:
             default) fires on the 1st, 4th, 7th ... per task. The
             first thinking message of every task always gets a judge
             call; counters reset on task transition.
+        dispatch_drift_interventions:
+            Whether detected drift enters the intervention ladder.
+            ``False`` preserves detector execution, judgement events,
+            and drift events while suppressing cancellation, corrective
+            messages, planner refinement, and escalation. The
+            :func:`goldfive.wrap` helper uses this mode for its default
+            steerer when ``judge_only=True``. Defaults to ``True`` so
+            directly constructed steerers and full runs retain their
+            existing behavior.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
         for the full feature-gate semantics. The GOAL_DRIFT check
@@ -477,6 +487,7 @@ class DefaultSteerer:
         """
         self._sinks: list[Any] = []
         self._planner: Any | None = None
+        self._dispatch_drift_interventions = bool(dispatch_drift_interventions)
         # Optional adapter back-reference. Wired via :meth:`bind_adapter`
         # so the steerer can tag the next mid-invocation cancel with a
         # symbolic reason (``user_steer``) before the executor triggers

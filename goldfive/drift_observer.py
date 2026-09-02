@@ -4985,6 +4985,20 @@ class DriftObserver:
         # :meth:`_resolve_authored_by`.
         if not drift.authored_by:
             drift.authored_by = self._resolve_authored_by(drift)
+        # Judge-only runs retain detector and event evidence but never
+        # enter the response policy. This gate is distinct from
+        # ``SteeringConfig.observation_only``: that setting still computes
+        # dry-run refinements, whereas this policy stops before freshness
+        # bookkeeping, cancellation, promotion, the intervention ladder,
+        # planner refinement, or escalation.
+        if not self._steerer._dispatch_drift_interventions:
+            await self._emit_drift_detected(
+                session,
+                drift,
+                decision_outcome="drift_observed_only",
+                decision_reason="drift intervention dispatch disabled",
+            )
+            return
         # goldfive#245 — verdict-freshness gate. Every observation/
         # detector stamps ``observed_revision_index`` from
         # ``session.plan.revision_index`` BEFORE its LLM await; the
