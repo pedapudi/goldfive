@@ -22,6 +22,7 @@ This chapter is the exhaustive enumeration. For the *behaviour* behind a knob, f
 | File / symbol | What lives there |
 |---|---|
 | `goldfive/config.py` | The typed config: `RuntimeConfig` + seven sub-configs (`EmbeddingConfig`, `JudgeConfig`, `ToolLoopConfig`, `ReasoningDriftConfig`, `GoalDriftConfig`, `SteeringConfig`, `AgentConfig`), all `from_env()` classmethods, and the env-parse helpers (`_read_bool_env`, `_read_int_env`, `_read_float_env`, `_read_optional_float_env`, `_read_str_env`, `_read_optional_str_env`, `_read_steer_threshold_env`, `_read_reasoning_drift_mode_env`). |
+| `goldfive/runtime_config_document.py` | The validated, JSON-compatible `RuntimeConfigDocument` used for persisted configuration, credential-variable references, optional-dependency checks, and environment-independent `RuntimeConfig` construction. Persisted documents never contain credential values. |
 | `goldfive/convenience.py` | `wrap()` and `run()` — every user-facing kwarg. |
 | `goldfive/runner.py` | `Runner.__init__` kwargs; `GOLDFIVE_FAIL_FAST_REVISION_REJECTION` reader. |
 | `goldfive/executors/sequential.py` | `SequentialExecutor.__init__` kwargs; `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL`; `_DEFAULT_MAX_NUDGE_REPLAYS`. |
@@ -115,7 +116,7 @@ Tracing `resolved_runtime` through `goldfive/convenience.py` `wrap()`, each of t
 
 Note `reasoning_drift` and `tool_loops` are threaded TWICE — once process-wide into their detector modules (thresholds the deterministic detectors read) and once into the steerer (which owns the reasoning-judge scheduling and tool-loop tracker construction). This is why an explicit `steerer=` still gets the process-wide detector thresholds but NOT the steerer-side scheduling config. `agent` is ADK-only — the Claude / callable adapters ignore `llm_call_timeout_ms` / `agent_max_output_tokens` (no analogous surface today).
 
-### Four ways to construct a `RuntimeConfig`
+### Ways to construct a `RuntimeConfig`
 
 | Pattern | Code | When |
 |---|---|---|
@@ -123,6 +124,7 @@ Note `reasoning_drift` and `tool_loops` are threaded TWICE — once process-wide
 | From env | `RuntimeConfig.from_env()` | Reproduce the `wrap(tree)` (no `runtime=`) behaviour explicitly, e.g. to inspect what env resolved to. |
 | From env, then tweak | `cfg = RuntimeConfig.from_env(); cfg.steering.threshold = "critical"` | The blessed debugging pattern — dataclasses are mutable by design. |
 | Snapshot variant | `dataclasses.replace(cfg, steering=SteeringConfig(observation_only=False))` | You want a variant WITHOUT mutating the source (e.g. two Runners from one base). |
+| Persisted document | `RuntimeConfigDocument.from_mapping(raw).build(resolve_secret=...)` | You need strict JSON input, canonical defaults, credential-variable references, or configuration that cannot change with ambient environment variables. |
 
 A subtlety: `wrap(tree)` with no `runtime=` uses `RuntimeConfig.from_env()`,
 which resolves every supported environment setting. Passing

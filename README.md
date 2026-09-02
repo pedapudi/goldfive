@@ -180,6 +180,14 @@ Or set the env var `GOLDFIVE_STEER_OBSERVATION_ONLY=0`. See
 [docs/design/CONTROL-CHANNEL.md §5.5](docs/design/CONTROL-CHANNEL.md)
 for the full contract.
 
+Applications that persist configuration can use
+`goldfive.RuntimeConfigDocument`. It produces a complete canonical mapping,
+stores credential-variable names, and never stores credential values. It
+validates strict JSON input and builds `RuntimeConfig` only after the caller
+supplies a credential resolver. It does not read `GOLDFIVE_*` environment
+settings. See the
+[persisted runtime configuration reference](docs/reference/api.md#persisted-runtime-configuration).
+
 Every default component is overridable. Keyword arguments accepted by
 both `wrap` and `run`:
 
