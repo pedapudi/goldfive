@@ -271,6 +271,12 @@ class Runner:
         structurally impossible.
 
         See PLAN-LIFECYCLE.md §4.5.1 for the full rationale.
+    strict_state_ownership:
+        Per-Runner state and plan ownership tripwire. ``True`` raises on
+        writes outside their designated ownership regions; ``False`` keeps
+        those checks non-fatal. ``None`` preserves the legacy environment
+        and pytest fallback for direct Runner callers. :func:`goldfive.wrap`
+        always passes the resolved :class:`RuntimeConfig` value.
     """
 
     def __init__(
@@ -289,6 +295,7 @@ class Runner:
         planner_gate: Any = "auto",
         drift_self_reporting: bool | list[str] = False,
         fail_fast_on_revision_rejection: bool | None = None,
+        strict_state_ownership: bool | None = None,
         **legacy_kwargs: Any,
     ) -> None:
         # Stamp the running build's identity at construction so logs
@@ -458,6 +465,7 @@ class Runner:
         self._fail_fast_on_revision_rejection: bool = bool(
             fail_fast_on_revision_rejection
         )
+        self._strict_state_ownership = strict_state_ownership
         # One-shot latch for the ledger-mode / forecast-shaped-plan
         # incoherent-combo warning (see
         # :meth:`_warn_if_ledger_mode_without_ledger_plan`).
@@ -631,13 +639,14 @@ class Runner:
         # both normal return AND ``BaseException`` propagation so a
         # cancelled turn's stash always lands before the next turn's
         # seeding runs.
-        async with self._lock_for(convo_key):
-            return await self._run_locked(
-                user_input,
-                context=context,
-                session_id=session_id,
-                convo_key=convo_key,
-            )
+        with _state_audit.strict_state_ownership(self._strict_state_ownership):
+            async with self._lock_for(convo_key):
+                return await self._run_locked(
+                    user_input,
+                    context=context,
+                    session_id=session_id,
+                    convo_key=convo_key,
+                )
 
     async def _run_locked(
         self,

@@ -24,7 +24,7 @@ by :func:`set_session_plan` paired with the
 :func:`channel_processor_active`). Channel-processor paths in
 :mod:`goldfive.steerer` enter the contextvar before swapping
 ``session.plan``; sites that swap from outside the channel processor
-emit a WARNING (or, under ``GOLDFIVE_STRICT_STATE_OWNERSHIP=1``, raise
+emit a WARNING (or, under the Runner's strict state-ownership policy, raise
 :class:`PlanOwnershipViolation`).
 """
 
@@ -37,9 +37,7 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
-import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -1478,21 +1476,11 @@ def channel_processor_active() -> Iterator[None]:
 
 
 def _strict_state_ownership_enabled() -> bool:
-    """Return whether ``GOLDFIVE_STRICT_STATE_OWNERSHIP`` is on.
+    """Return the shared state-ownership policy for this async context."""
+    # Local import avoids the module-load cycle: _state_audit imports Session.
+    from goldfive import _state_audit
 
-    Mirrors the resolution in :mod:`goldfive._state_audit`: explicit
-    1/0 wins; otherwise default-on under pytest, default-off in
-    production. We intentionally don't ``import _state_audit`` here to
-    avoid a typing-time circular import (state-audit imports
-    Session). The duplication is a few lines and bracketed by a unit
-    test in ``tests/test_immutable_plan.py``.
-    """
-    raw = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP", "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return "pytest" in sys.modules
+    return _state_audit.is_enabled()
 
 
 def set_session_plan(session: Session, plan: Plan | None) -> None:

@@ -1,19 +1,9 @@
-"""Typed, per-Runner configuration for goldfive (goldfive#225).
+"""Typed runtime configuration for goldfive.
 
-goldfive has accumulated ad-hoc configuration knobs across four
-subsystems, each with a different mechanism:
-
-1. **Embedding backend** (#221). ``GOLDFIVE_EMBEDDING_BASE_URL`` /
-   ``_MODEL`` / ``_API_KEY`` / ``_TIMEOUT_MS`` read at first call in
-   :mod:`goldfive.drift._embed`.
-2. **Tool-loop detector**. ``GOLDFIVE_TOOL_LOOP_WINDOW`` /
-   ``_EXACT_THRESHOLD`` / ``_NAME_THRESHOLD`` / ``_ALTERNATING_THRESHOLD``
-   read in :mod:`goldfive.drift.tool_loops`.
-3. **Reasoning-drift thresholds**. Module-level constants in
-   :mod:`goldfive.drift.reasoning` with no env wiring at all.
-4. **Goal-drift scheduling**. Kwargs on
-   :class:`~goldfive.steerer.DefaultSteerer` that ``goldfive.wrap()``
-   does not thread through.
+:class:`RuntimeConfig` collects the settings installed by
+:func:`goldfive.wrap`. Its subsystem dataclasses keep endpoint, detector,
+and steering settings discoverable in Python while ``from_env()`` preserves
+the supported environment-based deployment surface.
 
 Steering policy (goldfive#254). :class:`SteeringConfig` now also
 gates the THREE actual steering injection points in
@@ -35,14 +25,11 @@ still runs (operators can see what the planner WOULD have produced via
 not touched. Operators graduate to active steering explicitly via
 ``RuntimeConfig(steering=SteeringConfig(observation_only=False))``.
 
-This module introduces a typed :class:`RuntimeConfig` dataclass with
-four sub-configs that collapses those four surfaces into a single
-object operators can pass to :func:`goldfive.wrap`. The ``from_env()``
-classmethods preserve the existing env-var surface (names unchanged
-where they already exist; new ``GOLDFIVE_DRIFT_*`` / ``GOLDFIVE_GOAL_DRIFT_*``
-names for the knobs that did not previously have env wiring) so
-``goldfive.wrap(tree)`` with no ``runtime=`` kwarg remains byte-
-identical to pre-#225 behaviour.
+Concrete values in an explicit config are authoritative. The six fields
+whose behavior predated this typed surface use ``None`` to preserve their
+documented low-level environment fallback. Omitting the ``runtime=`` argument
+asks :meth:`RuntimeConfig.from_env` to resolve every field from ``GOLDFIVE_*``
+variables and built-in defaults.
 
 Dataclasses are deliberately **mutable** (``frozen=False``). Operators
 commonly tweak a field after constructing from env (e.g. load
@@ -382,12 +369,16 @@ class EmbeddingConfig:
     extra is installed). When ``base_url`` is set, the HTTP backend is
     used exclusively — no silent fall-through to sentence-transformers
     on HTTP failure (matches the pre-#225 env-driven contract).
+
+    ``breaker_cooldown_s`` controls how long a tripped HTTP-backend circuit
+    breaker waits before admitting one half-open probe.
     """
 
     base_url: str | None = None
     model: str = ""
     api_key: str | None = None
     timeout_ms: int = 10_000
+    breaker_cooldown_s: float | None = None
 
     @classmethod
     def from_env(cls) -> EmbeddingConfig:
@@ -408,6 +399,10 @@ class EmbeddingConfig:
             ),
             timeout_ms=_read_int_env(
                 "GOLDFIVE_EMBEDDING_TIMEOUT_MS", defaults.timeout_ms
+            ),
+            breaker_cooldown_s=_read_float_env(
+                "GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S",
+                60.0,
             ),
         )
 
@@ -784,6 +779,20 @@ class SteeringConfig:
     threshold: str = "warning"
     suppression_window_turns: int = 3
     observation_only: bool = True
+    #: Re-enable the soft-retired capability detector that infers whether an
+    #: AgentTool-only agent received a leaf task. The heuristic is off by
+    #: default because it relies on task-title and description keywords.
+    #: ``None`` preserves the environment fallback for callers that construct
+    #: a steerer directly. Explicit ``True`` or ``False`` is authoritative.
+    #: Env: ``GOLDFIVE_CAPABILITY_RULE_A``.
+    capability_rule_a_enabled: bool | None = None
+    #: Re-enable the soft-retired capability detector that compares an invoked
+    #: agent's name with other pending task descriptions. The heuristic is off
+    #: by default because it relies on name and task-text stems.
+    #: ``None`` preserves the environment fallback for callers that construct
+    #: a steerer directly. Explicit ``True`` or ``False`` is authoritative.
+    #: Env: ``GOLDFIVE_CAPABILITY_RULE_C``.
+    capability_rule_c_enabled: bool | None = None
     #: Names of :class:`~goldfive.context_editor.ContextEditRule` rules to
     #: register on the ADK plugin's :class:`~goldfive.context_editor.ContextEditor`
     #: (goldfive#397). ``None`` (the default) AND an empty list both leave
@@ -1109,6 +1118,14 @@ class SteeringConfig:
                 "GOLDFIVE_STEER_OBSERVATION_ONLY",
                 defaults.observation_only,
             ),
+            capability_rule_a_enabled=_read_bool_env(
+                "GOLDFIVE_CAPABILITY_RULE_A",
+                False,
+            ),
+            capability_rule_c_enabled=_read_bool_env(
+                "GOLDFIVE_CAPABILITY_RULE_C",
+                False,
+            ),
             context_editor_rules=rules,
             descriptive_growth_enabled=_read_bool_env(
                 "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
@@ -1243,7 +1260,7 @@ class RuntimeConfig:
     """Per-Runner typed configuration aggregate.
 
     Pass to :func:`goldfive.wrap` via the ``runtime=`` kwarg to install
-    all four sub-configs at once. When the kwarg is omitted, ``wrap()``
+    every supported runtime setting at once. When the kwarg is omitted, ``wrap()``
     builds an instance from the environment via :meth:`from_env` —
     byte-identical to pre-#225 behaviour for callers that relied on
     env vars or accepted the built-in defaults.
@@ -1258,6 +1275,12 @@ class RuntimeConfig:
     judge: JudgeConfig = dataclasses.field(default_factory=JudgeConfig)
     steering: SteeringConfig = dataclasses.field(default_factory=SteeringConfig)
     agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
+    #: Abort when a goldfive-authored plan revision fails validation.
+    fail_fast_on_revision_rejection: bool | None = None
+    #: Abort rather than reinvoke after an internal supersede cancellation.
+    fail_fast_on_invoke_cancel: bool | None = None
+    #: Raise on state and plan writes outside their ownership boundaries.
+    strict_state_ownership: bool | None = None
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -1268,6 +1291,8 @@ class RuntimeConfig:
         the others. The result is a fresh instance; callers may mutate
         it in place or :func:`dataclasses.replace` to derive a variant.
         """
+        from goldfive import _state_audit
+
         return cls(
             embedding=EmbeddingConfig.from_env(),
             tool_loops=ToolLoopConfig.from_env(),
@@ -1276,4 +1301,15 @@ class RuntimeConfig:
             judge=JudgeConfig.from_env(),
             steering=SteeringConfig.from_env(),
             agent=AgentConfig.from_env(),
+            # These two legacy switches intentionally recognise only the
+            # exact string "1". Their direct Runner and executor constructors
+            # retain the same fallback for callers that bypass RuntimeConfig.
+            fail_fast_on_revision_rejection=(
+                os.environ.get("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "0")
+                == "1"
+            ),
+            fail_fast_on_invoke_cancel=(
+                os.environ.get("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "0") == "1"
+            ),
+            strict_state_ownership=_state_audit.resolve_env_default(),
         )

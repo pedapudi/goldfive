@@ -106,8 +106,9 @@ kinds group naturally into six categories.
 **Rule status under plan-descriptive growth + the PR 3 demotion
 (goldfive#423 / AGENCY-PRESERVATION.md PR 2 & PR 3).**
 
-* **Rule A is soft-retired (PR 3): default OFF**, re-enabled only via
-  `GOLDFIVE_CAPABILITY_RULE_A=1`. Its leaf-task read is stem/keyword
+* **Rule A is soft-retired (PR 3): default OFF**, re-enabled through
+  `SteeringConfig.capability_rule_a_enabled` (or the matching environment
+  fallback). Its leaf-task read is stem/keyword
   NL classification — the #166/#167 anti-pattern — and was the source
   of the e2e 2d27ff4a refine storm. Even when re-enabled it only
   OBSERVEs: the `CAPABILITY_MISMATCH` ladder row demotes the CRITICAL
@@ -118,8 +119,9 @@ kinds group naturally into six categories.
   the ladder refines (WARNING→ABSORB) but cannot escalate to
   cancel/pause.
 * **Rule C is soft-retired** (PR 2): silent unless
-  `GOLDFIVE_CAPABILITY_RULE_C=1`; like Rule A it routes to OBSERVE when
-  re-enabled.
+  `SteeringConfig.capability_rule_c_enabled` is true; like Rule A it routes
+  to OBSERVE when re-enabled. Direct detector callers may use the matching
+  environment fallback.
 * Both A and B are still skipped when the bound task is
   `discovered=True` (PLAN-DESCRIPTIVE-GROWTH.md §11.4(a)). With
   `SteeringConfig.descriptive_growth_enabled=True` (the default; env

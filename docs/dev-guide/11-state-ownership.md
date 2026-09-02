@@ -689,7 +689,7 @@ The pattern to copy for any new per-call LLM knob: **a ContextVar with a context
 
 ### `_CHANNEL_PROCESSOR_ACTIVE` — the plan-write envelope
 
-`Session.plan` has exactly one writer (invariant #3). The enforcement is a ContextVar, not a type: `set_session_plan(session, plan)` (`goldfive/types.py`) checks `_CHANNEL_PROCESSOR_ACTIVE`. Outside the region it logs a WARNING with a stack hint; under `GOLDFIVE_STRICT_STATE_OWNERSHIP=1` it **raises `PlanOwnershipViolation`**. The steerer/executor plan-install paths wrap their region in `channel_processor_active()`; sinks and judges read `session.plan` and never write it. The single writer is the steerer's channel processor (`DefaultSteerer._invoke_passthrough_with_control` / `_handle_drift` / `_apply_revision` and the executor install paths they delegate to). See [10-planning-and-revision.md](10-planning-and-revision.md).
+`Session.plan` has exactly one writer (invariant #3). The enforcement is a ContextVar, not a type: `set_session_plan(session, plan)` (`goldfive/types.py`) checks `_CHANNEL_PROCESSOR_ACTIVE`. Outside the region it logs a WARNING with a stack hint; when strict state ownership is enabled through `RuntimeConfig` or its environment fallback, it **raises `PlanOwnershipViolation`**. The steerer/executor plan-install paths wrap their region in `channel_processor_active()`; sinks and judges read `session.plan` and never write it. The single writer is the steerer's channel processor (`DefaultSteerer._invoke_passthrough_with_control` / `_handle_drift` / `_apply_revision` and the executor install paths they delegate to). See [10-planning-and-revision.md](10-planning-and-revision.md).
 
 ---
 
@@ -728,13 +728,28 @@ The tripwire enforces invariant #2 at runtime by patching the single write funne
 
 `StateOwnershipViolation` (and its sibling `CancellationStashViolation`) inherit from **`BaseException`, not `Exception`**. This is deliberate: many catalogued sites sit inside broad `try/except Exception` blocks (state writes are best-effort). An `Exception` subclass would be silently swallowed by those blocks — the exact failure mode `#275` suffers in production, where ADK's stale-session `ValueError` is caught and dropped. `BaseException` propagates through `except Exception` and surfaces loudly.
 
-**Defaults** (resolved by `is_enabled()`): `GOLDFIVE_STRICT_STATE_OWNERSHIP=1` force-on, `=0` force-off, **unset → on inside pytest** (`"pytest" in sys.modules`), off in production. CI runs with it enabled. `enable()` / `disable()` flip the env var; `expect_violation(reason)` is a test cm that asserts a violation fires.
+**Defaults** (resolved by `is_enabled()`): a concrete per-Runner
+`RuntimeConfig.strict_state_ownership` value wins. Without a per-Runner
+override, `GOLDFIVE_STRICT_STATE_OWNERSHIP=1` forces the check on, `=0` forces
+it off, and an unset value enables it under pytest and disables it otherwise.
+The Runner override is stored in a `ContextVar`, so concurrent Runners may use
+different policies without cross-talk. `enable()` / `disable()` flip the env
+fallback; `expect_violation(reason)` is a test context manager that asserts a
+violation fires.
 
 **The catalog is the allowlist.** `_KNOWN_CALLERS` is a `frozenset[tuple[str, str]]` of `(filename_suffix, qualname_suffix)` pairs — one per surviving catalogued write. `_check_caller` → `_frame_matches` walks the stack for a matching frame; a match allows the write, no match raises. This is why the catalog and the allowlist must shrink in lockstep: when both are empty, the migration is complete and any callback-time ADK-state write raises. `known_callers_count()` exposes the current size for a regression assertion. When you legitimately need to add a new catalogued write (rare — you almost never should), you add the `(file, function)` pair here *and* an entry to §5 of the design doc; otherwise the tripwire is telling you your write is on the wrong surface.
 
 ### The plan-ownership sibling (`PlanOwnershipViolation`)
 
-`set_session_plan` (`goldfive/types.py`) enforces invariant #3 with the **same env gate** but a distinct exception. Outside a `channel_processor_active()` region it logs a WARNING with a one-line stack hint; under strict mode it raises `PlanOwnershipViolation`. The resolution helper `_strict_state_ownership_enabled()` deliberately **duplicates** the env logic from `_state_audit.is_enabled()` (a few lines) rather than importing `_state_audit`, to avoid a typing-time circular import (state-audit imports `Session`). That duplication is bracketed by a unit test in `tests/test_immutable_plan.py`; if you change the env-resolution rule, change it in both places. The plan check is a **runtime smell-test, not a type guarantee** — the `frozen=True` dataclasses already prevent `task.status = X` mutations; this catches the remaining axis: who owns the *pointer* swap.
+`set_session_plan` (`goldfive/types.py`) enforces invariant #3 through the same
+shared `_state_audit.is_enabled()` policy but raises a distinct
+`PlanOwnershipViolation`. Outside a `channel_processor_active()` region it
+logs a WARNING with a one-line stack hint; under strict mode it raises. The
+local import in `_strict_state_ownership_enabled()` avoids the module-load
+cycle with `_state_audit`, which imports `Session`. The plan check is a
+**runtime smell-test, not a type guarantee** — the `frozen=True` dataclasses
+already prevent `task.status = X` mutations; this catches the remaining axis:
+who owns the *pointer* swap.
 
 ### Editing the tripwire safely
 

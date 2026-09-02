@@ -21,6 +21,7 @@ These tests verify three behaviours:
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -272,6 +273,28 @@ def test_state_audit_is_off_in_production_default() -> None:
             os.environ.pop("GOLDFIVE_STRICT_STATE_OWNERSHIP", None)
         else:
             os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = prior
+
+
+def test_typed_state_ownership_policy_wins_and_restores() -> None:
+    """A scoped typed value overrides the environment without leaking."""
+    os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = "1"
+
+    with _state_audit.strict_state_ownership(False):
+        assert not _state_audit.is_enabled()
+
+    assert _state_audit.is_enabled()
+
+
+@pytest.mark.asyncio
+async def test_typed_state_ownership_policy_is_task_local() -> None:
+    """Concurrent Runner contexts can enforce different policies safely."""
+
+    async def observe(enabled: bool) -> bool:
+        with _state_audit.strict_state_ownership(enabled):
+            await asyncio.sleep(0)
+            return _state_audit.is_enabled()
+
+    assert await asyncio.gather(observe(False), observe(True)) == [False, True]
 
 
 # ---------------------------------------------------------------------------

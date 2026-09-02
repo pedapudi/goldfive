@@ -17,6 +17,12 @@ first time :func:`_get_model` is called.
      empty model (they use the single loaded model).
    * ``GOLDFIVE_EMBEDDING_API_KEY`` -- optional bearer token.
    * ``GOLDFIVE_EMBEDDING_TIMEOUT_MS`` -- HTTP timeout, default 10000.
+   * ``GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S`` -- half-open retry delay,
+     default 60 seconds.
+
+   :class:`goldfive.config.EmbeddingConfig` exposes the same settings to
+   callers that use :func:`goldfive.wrap`; an installed typed config wins
+   over these direct-module environment fallbacks.
 
 2. **sentence-transformers backend** -- fallback when the env var is
    unset. Requires the ``goldfive[embedding]`` extra to be installed.
@@ -237,7 +243,14 @@ def _reset_cache() -> None:
 
 
 def _recovery_cooldown_s() -> float:
-    """Return the half-open cooldown, honouring the env override."""
+    """Return the configured half-open cooldown.
+
+    A concrete value in an installed :class:`EmbeddingConfig` wins over the
+    legacy environment fallback. ``None`` preserves that fallback for callers
+    whose embedding config predates the typed cooldown field.
+    """
+    if _CONFIG is not None and _CONFIG.breaker_cooldown_s is not None:
+        return _CONFIG.breaker_cooldown_s
     raw = os.environ.get("GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S", "")
     if raw:
         try:
