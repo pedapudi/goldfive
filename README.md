@@ -120,7 +120,6 @@ Optional extras:
   (`openai`, with `httpx` fallback for embeddings).
 - `goldfive[embedding]` — local sentence-transformer embeddings
   (`sentence-transformers`).
-- `goldfive[events]` — JSONL, logging, and SQLite event sinks (`protobuf`).
 - `goldfive[examples]` — runtime deps for the scripts in [`examples/`](examples/) (`rich`).
 - `goldfive[proto]` — gRPC event transport and proto regeneration with
   `make proto` (`protobuf`, `grpcio`, `grpcio-tools`, `mypy-protobuf`).

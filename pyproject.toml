@@ -22,7 +22,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
+dependencies = [
+    "protobuf>=6.31.1",
+]
 
 [project.optional-dependencies]
 adk = [
@@ -42,9 +44,6 @@ dev = [
 ]
 embedding = [
     "sentence-transformers>=3.0",
-]
-events = [
-    "protobuf>=6.31.1",
 ]
 remote = [
     "httpx>=0.27",

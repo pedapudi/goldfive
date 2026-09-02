@@ -15,12 +15,12 @@ Five implementations ship in-box:
 * :class:`GRPCSink` — forwards proto events over a client-streaming
   gRPC RPC to a ``GoldfiveIngress`` server (see ``goldfive.server``).
 
-``InMemorySink`` is always importable. The logging and persistence sinks
-depend on the optional ``events`` extra (``google.protobuf``). The gRPC sink
-depends on ``proto``, which also carries the gRPC and code-generation tools.
-Importing a sink without its extra raises :class:`ImportError` with a friendly
-message. The top-level ``goldfive`` module handles that import gracefully so
-the bulk of the public API stays usable without either extra.
+``InMemorySink`` and the protobuf-backed logging and persistence sinks are
+always importable. The gRPC sink depends on ``proto``, which carries the gRPC
+and code-generation tools. Importing that sink without its extra raises
+:class:`ImportError` with a friendly message. The top-level ``goldfive``
+module handles that import gracefully so the rest of the public API remains
+usable without the gRPC tooling.
 
 All sinks conform to the ``EventSink`` protocol pinned in
 ``goldfive.protocols`` (async ``emit`` / async ``close``).
