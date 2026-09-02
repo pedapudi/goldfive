@@ -35,7 +35,8 @@ from goldfive import (
     GoalDeriver, Planner, Executor, Steerer, AgentAdapter, EventSink,
     CallLLM, ClosableCallLLM,
     # dedicated OpenAI-compatible call route
-    JudgeConfig, make_default_openai_call_llm, maybe_close_call_llm,
+    JudgeConfig, JsonValue, RuntimeConfig, RuntimeConfigDocument, SecretResolver,
+    make_default_openai_call_llm, maybe_close_call_llm,
     # results
     InvocationResult, ExecutionOutcome,
     # reporting
@@ -70,6 +71,116 @@ from goldfive.adapters.auto import auto_adapter
 appear in `goldfive.__all__` unconditionally; when the extra is
 missing the module attribute resolves to `None` at import time,
 surfacing the missing dependency at construction rather than import.
+
+## Persisted runtime configuration
+
+`RuntimeConfigDocument` validates JSON-compatible configuration before an
+application persists it, hashes it, or sends it across a process boundary.
+Callers construct it through the validating factory, and `to_mapping()`
+returns a deep copy. Its persisted mapping contains credential-variable names.
+It never contains credential values. The public import is:
+
+```python
+from goldfive import RuntimeConfigDocument
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class RuntimeConfigDocument:
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, object],
+        *,
+        defaults: Mapping[str, object] | None = None,
+    ) -> RuntimeConfigDocument: ...
+
+    @classmethod
+    def scaffold(
+        cls, *, defaults: Mapping[str, object] | None = None
+    ) -> dict[str, JsonValue]: ...
+
+    def to_mapping(self) -> dict[str, JsonValue]: ...
+
+    @property
+    def secret_env_names(self) -> tuple[str, ...]: ...
+
+    @property
+    def required_extras(self) -> frozenset[Literal["remote", "embedding"]]: ...
+
+    def missing_runtime_capabilities(self) -> tuple[str, ...]: ...
+
+    def build(self, *, resolve_secret: SecretResolver) -> RuntimeConfig: ...
+```
+
+The document has the same nested groups as `RuntimeConfig`. Use
+`RuntimeConfigDocument.scaffold()` to obtain the complete canonical mapping.
+Omitted fields receive fixed library defaults. The `defaults` mapping is
+validated first, then the operator mapping overlays it recursively.
+
+Three document fields replace compatibility-oriented internal names:
+
+| Document field | Built `SteeringConfig` field |
+|---|---|
+| `delegation_only_agent_leaf_task_detector_enabled` | `capability_rule_a_enabled` |
+| `pending_task_role_mismatch_detector_enabled` | `capability_rule_c_enabled` |
+| `cancel_and_reinvoke_interventions_enabled` | `legacy_ladder` |
+
+Six persisted defaults differ from nullable compatibility fields on
+`RuntimeConfig()`:
+
+| Document field | Persisted default |
+|---|---:|
+| `embedding.breaker_cooldown_s` | `60.0` |
+| `steering.delegation_only_agent_leaf_task_detector_enabled` | `false` |
+| `steering.pending_task_role_mismatch_detector_enabled` | `false` |
+| `fail_fast_on_revision_rejection` | `false` |
+| `fail_fast_on_invoke_cancel` | `false` |
+| `strict_state_ownership` | `false` |
+
+`agent.call_timeout_ms` remains `120_000`. A caller can supply an
+application-level default without changing Goldfive's general default:
+
+```python
+document = RuntimeConfigDocument.from_mapping(
+    operator_config,
+    defaults={"agent": {"call_timeout_ms": 1_800_000}},
+)
+```
+
+Endpoint credentials use variable names rather than values:
+
+```python
+document = RuntimeConfigDocument.from_mapping(
+    {
+        "judge": {
+            "base_url": "https://judge.example",
+            "model": "judge-model",
+            "revision": "deployment-2026-09-01",
+            "api_key_env": "JUDGE_API_KEY",
+        }
+    }
+)
+runtime = document.build(resolve_secret=os.environ.get)
+```
+
+`to_mapping()` includes `api_key_env`, which names the credential variable. It
+never includes an `api_key` value. `revision` remains canonical endpoint
+metadata; `RuntimeConfig` does not consume it. `build()` is the only method
+that calls the credential resolver. A missing credential error names the
+variable and omits the resolved value.
+
+`required_extras` reports install groups. Remote judge or embedding endpoints
+require `goldfive[remote]`; local embedding mode requires
+`goldfive[embedding]`. `missing_runtime_capabilities()` probes the selected
+backend imports and returns any unavailable capability identifier:
+`remote_judge`, `remote_embedding`, or `local_embedding`.
+
+Unknown keys, non-JSON values, non-finite numbers, invalid ranges, invalid
+field combinations, and endpoint URLs containing credentials, queries, or
+fragments raise `ValueError`. Endpoint URLs also omit `/v1` because Goldfive
+appends it. `RuntimeConfig` and `RuntimeConfig.from_env()` retain their
+existing mutable and environment-compatible behavior.
 
 ## OpenAI-compatible LLM callable
 

@@ -57,6 +57,11 @@ from goldfive.reporting import (
 )
 from goldfive.results import ExecutionOutcome, InvocationResult
 from goldfive.runner import Runner
+from goldfive.runtime_config_document import (
+    JsonValue,
+    RuntimeConfigDocument,
+    SecretResolver,
+)
 from goldfive.sinks import (
     GRPCSink,
     InMemorySink,
@@ -118,6 +123,7 @@ __all__ = [
     "JudgeConfig",
     "JudgeContext",
     "JudgeVerdict",
+    "JsonValue",
     "LLMGoalDeriver",
     "LLMPlanner",
     "LiteralGoalDeriver",
@@ -132,6 +138,8 @@ __all__ = [
     "ReportingToolSpec",
     "Runner",
     "RuntimeConfig",
+    "RuntimeConfigDocument",
+    "SecretResolver",
     "SQLitePersistenceSink",
     "SequentialExecutor",
     "Session",
